@@ -119,18 +119,13 @@ struct SharedHistoryRootView: View {
                 )
                 .shadow(color: Color.black.opacity(0.18), radius: 14, x: 0, y: 8)
 
-            VStack(spacing: 0) {
-                Capsule()
-                    .fill(Color.secondary.opacity(0.28))
-                    .frame(width: 32, height: 4)
-                    .padding(.top, 8)
-                    .padding(.bottom, 10)
-
-                ContentView()
-                    .environmentObject(itemsVM)
-                    .padding(.horizontal, HistoryUI.innerHorizontal)
-                    .padding(.bottom, HistoryUI.innerVertical)
-            }
+            // No drag grabber — the entire panel is draggable via
+            // `isMovableByWindowBackground`, so the capsule was decorative-only
+            // and just pushed real content down.
+            ContentView()
+                .environmentObject(itemsVM)
+                .padding(.horizontal, HistoryUI.innerHorizontal)
+                .padding(.bottom, HistoryUI.innerVertical)
         }
         .padding(HistoryUI.outerPadding)
         .frame(width: HistoryUI.panelWidth, height: HistoryUI.panelHeight)
@@ -201,6 +196,8 @@ struct ContentView: View {
     @State private var selectedID: UUID? = nil
     @State private var copiedTimestamps: [UUID: Date] = [:]
     @State private var hoverID: UUID? = nil
+    /// Which row's full-text popover is currently visible (one at a time across the list).
+    @State private var previewItemID: UUID? = nil
     @FocusState private var searchFocused: Bool
     @State private var visibleLimit: Int = 30
     private let maxVisible: Int = 200
@@ -268,7 +265,8 @@ struct ContentView: View {
             ClipRow(
                 item: item,
                 isSelected: selectedID == item.id,
-                isCopied: isRecentlyCopied(item.id)
+                isCopied: isRecentlyCopied(item.id),
+                previewItemID: $previewItemID
             )
             .id(item.id)
             .contentShape(Rectangle())
@@ -283,6 +281,7 @@ struct ContentView: View {
                 Button("Delete", role: .destructive) {
                     itemsVM.deleteItem(item.id)
                     if selectedID == item.id { selectedID = nil }
+                    if previewItemID == item.id { previewItemID = nil }
                     copiedTimestamps.removeValue(forKey: item.id)
                 }
             }
@@ -304,7 +303,7 @@ struct ContentView: View {
                 Spacer()
             }
             .padding(.horizontal, HistoryUI.innerHorizontal)
-            .padding(.top, 30)
+            .padding(.top, 18)
             .padding(.bottom, 6)
 
             searchBar
@@ -340,7 +339,7 @@ struct ContentView: View {
                 .scrollIndicators(.hidden)
                 .safeAreaInset(edge: .bottom) { Color.clear.frame(height: 8) }
                 .transaction { $0.animation = nil }
-                .onChange(of: selectedID) { id in
+                .onChange(of: selectedID) { _, id in
                     guard keyboardNavigated, let id else { return }
                     keyboardNavigated = false
                     withAnimation(.easeInOut(duration: 0.15)) { proxy.scrollTo(id, anchor: .center) }
@@ -349,7 +348,7 @@ struct ContentView: View {
             }
         }
         .onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { searchFocused = true } }
-        .onChange(of: searchText) { newValue in
+        .onChange(of: searchText) { _, newValue in
             searchDebounceTask?.cancel()
             if newValue.isEmpty { debouncedSearchText = ""; visibleLimit = 30; return }
             let task = DispatchWorkItem { debouncedSearchText = newValue; visibleLimit = 30 }
@@ -408,6 +407,7 @@ struct ContentView: View {
             let ordered = snapshot.ordered
             guard !ordered.isEmpty else { return }
             keyboardNavigated = true
+            previewItemID = nil
             if let currentID = selectedID, let idx = ordered.firstIndex(where: { $0.id == currentID }) {
                 selectedID = ordered[min(idx + 1, ordered.count - 1)].id
             } else { selectedID = ordered.first?.id }
@@ -415,13 +415,16 @@ struct ContentView: View {
             let ordered = snapshot.ordered
             guard !ordered.isEmpty else { return }
             keyboardNavigated = true
+            previewItemID = nil
             if let currentID = selectedID, let idx = ordered.firstIndex(where: { $0.id == currentID }) {
                 selectedID = ordered[max(idx - 1, 0)].id
             } else { selectedID = ordered.last?.id }
         case KeyCode.return:
             if let id = selectedID { perform(action: .copy, id: id) }
         case KeyCode.escape:
-            if !searchText.isEmpty { searchText = "" } else { selectedID = nil; HistoryWindowController.shared.close() }
+            if previewItemID != nil { previewItemID = nil }
+            else if !searchText.isEmpty { searchText = "" }
+            else { selectedID = nil; HistoryWindowController.shared.close() }
         default: break
         }
     }
@@ -433,8 +436,29 @@ struct ClipRow: View {
     let item: ClipItem
     var isSelected: Bool
     var isCopied: Bool
+    @Binding var previewItemID: UUID?
     @EnvironmentObject var itemsVM: ItemsViewModel
     @State private var isHovered: Bool = false
+    @State private var hoverWorkItem: DispatchWorkItem?
+
+    /// Heuristic for "would this row get visually truncated at lineLimit(2)?"
+    /// - Any newline: even short lines compose to >2 visual lines if there are 3+.
+    /// - Long single-line text wraps past two lines.
+    private var hasLongContent: Bool {
+        item.text.contains("\n") || item.text.count > 100
+    }
+
+    /// Bound to the popover; reads/writes the parent's shared `previewItemID`
+    /// so only one preview is visible across the whole list at a time.
+    private var showPreview: Binding<Bool> {
+        Binding(
+            get: { previewItemID == item.id },
+            set: { isOn in
+                if isOn { previewItemID = item.id }
+                else if previewItemID == item.id { previewItemID = nil }
+            }
+        )
+    }
 
     private static let formatter: DateFormatter = {
         let f = DateFormatter()
@@ -566,10 +590,35 @@ struct ClipRow: View {
         .animation(.spring(response: 0.22, dampingFraction: 0.9), value: isHovered)
         .onHover { hover in
             isHovered = hover
+            scheduleOrCancelPreview(hovering: hover)
+        }
+        .popover(isPresented: showPreview, arrowEdge: .trailing) {
+            FullTextPopover(text: item.text)
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel(Text("Clipboard item"))
         .accessibilityValue(Text(item.text))
+    }
+
+    /// Hover-in: immediately dismiss any other row's preview, then start a 1s timer
+    /// for this row (only when content might be truncated). Hover-out: cancel the
+    /// pending timer — but do NOT clear `previewItemID`, so the user can move the
+    /// cursor INTO the popover to select text. The popover is also dismissed when
+    /// any other row receives hover, or on keyboard up/down.
+    private func scheduleOrCancelPreview(hovering: Bool) {
+        hoverWorkItem?.cancel()
+        hoverWorkItem = nil
+        guard hovering else { return }
+        if previewItemID != nil && previewItemID != item.id {
+            previewItemID = nil
+        }
+        guard hasLongContent else { return }
+        let work = DispatchWorkItem {
+            // Only open if this row is still hovered when the timer fires.
+            if isHovered { previewItemID = item.id }
+        }
+        hoverWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
     }
 
     private var backgroundColor: Color {
@@ -577,6 +626,56 @@ struct ClipRow: View {
         if isSelected { return Color.accentColor.opacity(0.14) }
         if isHovered { return Color.gray.opacity(0.06) }
         return Color.white.opacity(0.02)
+    }
+}
+
+// MARK: - Full-text Preview Popover
+
+/// Scrollable, text-selectable popover with smart auto-sizing for the clipboard item.
+private struct FullTextPopover: View {
+    let text: String
+
+    private static let minW: CGFloat = 360
+    private static let maxW: CGFloat = 600
+    private static let minH: CGFloat = 80
+    private static let maxH: CGFloat = 420
+    private static let charPx: CGFloat = 6.8   // approx char width at 13pt monospaced-ish
+    private static let lineH: CGFloat  = 18    // approx line height at 13pt
+    private static let pad: CGFloat = 14
+
+    private var idealWidth: CGFloat {
+        // Width that fits the widest line without forcing wrap, clamped.
+        let widest = text.components(separatedBy: "\n")
+            .map { $0.count }.max() ?? 0
+        let estimated = CGFloat(widest) * Self.charPx + Self.pad * 2
+        return min(max(Self.minW, estimated), Self.maxW)
+    }
+
+    private var idealHeight: CGFloat {
+        // Account for wrap: lines that exceed the ideal width split. Cheap estimate.
+        let widthForText = idealWidth - Self.pad * 2
+        let charsPerLine = max(1, Int(widthForText / Self.charPx))
+        var lines = 0
+        for raw in text.components(separatedBy: "\n") {
+            let wraps = max(1, Int(ceil(Double(raw.count) / Double(charsPerLine))))
+            lines += wraps
+        }
+        let estimated = CGFloat(lines) * Self.lineH + Self.pad * 2
+        return min(max(Self.minH, estimated), Self.maxH)
+    }
+
+    var body: some View {
+        ScrollView {
+            Text(text)
+                .textSelection(.enabled)
+                .font(.system(size: 13))
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(Self.pad)
+        }
+        .frame(
+            minWidth: Self.minW, idealWidth: idealWidth, maxWidth: Self.maxW,
+            minHeight: Self.minH, idealHeight: idealHeight, maxHeight: Self.maxH
+        )
     }
 }
 
@@ -773,10 +872,6 @@ final class MenuBarController: NSObject {
 
         menu.addItem(.separator())
 
-        let about = NSMenuItem(title: "About Clip Board", action: #selector(menuShowAbout), keyEquivalent: "")
-        about.target = self
-        menu.addItem(about)
-
         let quit = NSMenuItem(title: "Quit Clip Board", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         quit.target = NSApp
         menu.addItem(quit)
@@ -792,11 +887,6 @@ final class MenuBarController: NSObject {
     @objc private func menuOpenAccessibilitySettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
         NSWorkspace.shared.open(url)
-    }
-
-    @objc private func menuShowAbout() {
-        NSApp.activate(ignoringOtherApps: true)
-        NSApp.orderFrontStandardAboutPanel(nil)
     }
 
     @objc private func menuToggleLaunchAtLogin() {

@@ -183,17 +183,19 @@ final class KeyManager {
 
 // MARK: - Persistence
 
+/// `nonisolated` so its Codable conformance is callable from the persistence IO queue
+/// despite the project's `-default-isolation=MainActor` flag.
+private nonisolated struct HistoryFile: Codable {
+    let version: Int
+    let items: [ClipItem]
+}
+
 final class PersistenceManager {
     static let shared = PersistenceManager()
     private init() {}
 
     private let fileName = "history.json.enc"
     private let currentSchemaVersion = 1
-
-    struct HistoryFile: Codable {
-        let version: Int
-        let items: [ClipItem]
-    }
 
     private static let encoder: JSONEncoder = {
         let e = JSONEncoder()

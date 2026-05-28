@@ -8,7 +8,10 @@ import os
 
 // MARK: - Data Model
 
-struct ClipItem: Identifiable, Codable, Equatable {
+/// `nonisolated` so its Codable conformance is callable from the persistence IO queue.
+/// Without it, the project's `-default-isolation=MainActor` flag would bind the
+/// conformance to the main actor and emit a Swift 6 forward-compat warning.
+nonisolated struct ClipItem: Identifiable, Codable, Equatable {
     let id: UUID
     let text: String
     var date: Date
