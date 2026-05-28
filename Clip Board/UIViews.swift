@@ -1,18 +1,14 @@
 // UIViews.swift
 //
-// Summary: Shared macOS SwiftUI/AppKit bridge views and window controller for the clipboard history UI.
-// - Keyboard handling via a representable NSView to intercept keyDown events
-// - VisualEffectView wrapper for macOS materials
-// - Shared root container for panel content
-// - Custom focus-ringless NSTextField bridge
-// - ContentView listing clipboard history with hover/keyboard interaction
-// - ClipRow presentation and interactions
-// - HistoryWindowController to show/close the non-activating floating panel
+// Shared SwiftUI/AppKit bridge views, history content view, floating panel controller,
+// menu-bar status item with right-click menu, and the hotkey recorder window.
 
 import SwiftUI
 import AppKit
 import Foundation
 import Combine
+import Carbon
+import ApplicationServices
 
 // Semantic key codes to avoid magic numbers
 private enum KeyCode {
@@ -24,12 +20,6 @@ private enum KeyCode {
 
 // MARK: - KeyDown Handling View
 
-/// A lightweight NSViewRepresentable that installs a local keyDown monitor while present in the view hierarchy.
-///
-/// This view:
-/// - Adds a local monitor for `.keyDown` events in `makeNSView` and forwards them to `onKeyDown`.
-/// - Removes the monitor in `dismantleNSView` to avoid leaks.
-/// - Can be used via the `View.onKeyDown(_:)` modifier provided below.
 struct KeyDownHandlingView: NSViewRepresentable {
     var onKeyDown: (NSEvent) -> Void
 
@@ -56,9 +46,6 @@ struct KeyDownHandlingView: NSViewRepresentable {
     class Coordinator { var monitor: Any? }
 }
 
-/// Convenience modifier to listen for keyDown events in a SwiftUI hierarchy.
-/// - Parameter handler: Closure invoked for each intercepted `NSEvent` of type `.keyDown`.
-/// - Returns: The modified view with an invisible background listener.
 extension View {
     func onKeyDown(_ handler: @escaping (NSEvent) -> Void) -> some View {
         background(KeyDownHandlingView(onKeyDown: handler))
@@ -67,9 +54,6 @@ extension View {
 
 // MARK: - Visual Effect Background
 
-/// SwiftUI wrapper around `NSVisualEffectView` to render macOS materials with configurable blending and emphasis.
-///
-/// Use this to achieve blurred/transparent backgrounds consistent with system UI.
 struct VisualEffectView: NSViewRepresentable {
     let material: NSVisualEffectView.Material
     let blendingMode: NSVisualEffectView.BlendingMode
@@ -105,12 +89,11 @@ struct VisualEffectView: NSViewRepresentable {
 
 // MARK: - Shared UI constants and container
 
-/// Layout constants used throughout the clipboard history UI.
 private enum HistoryUI {
     static let cornerRadius: CGFloat = 14
     static let panelWidth: CGFloat = 340
     static let panelHeight: CGFloat = 500
-    static let contentWidth: CGFloat = 328 // inner list width
+    static let contentWidth: CGFloat = 328
     static let contentHeight: CGFloat = 440
 
     static let outerPadding: CGFloat = 12
@@ -119,9 +102,6 @@ private enum HistoryUI {
     static let rowCorner: CGFloat = 10
 }
 
-/// Root container used by both the menu bar window and the hotkey-triggered floating panel.
-///
-/// Provides the background material, rounded corners, subtle border, and embeds `ContentView`.
 struct SharedHistoryRootView: View {
     let itemsVM: ItemsViewModel
 
@@ -131,7 +111,6 @@ struct SharedHistoryRootView: View {
 
     var body: some View {
         ZStack(alignment: .top) {
-            // Softer material for a cleaner look
             VisualEffectView(material: .sidebar, blendingMode: .withinWindow, isEmphasized: false)
                 .clipShape(RoundedRectangle(cornerRadius: HistoryUI.cornerRadius, style: .continuous))
                 .overlay(
@@ -141,7 +120,6 @@ struct SharedHistoryRootView: View {
                 .shadow(color: Color.black.opacity(0.18), radius: 14, x: 0, y: 8)
 
             VStack(spacing: 0) {
-                // Small grabber
                 Capsule()
                     .fill(Color.secondary.opacity(0.28))
                     .frame(width: 32, height: 4)
@@ -162,16 +140,11 @@ struct SharedHistoryRootView: View {
 
 // MARK: - Focus ringless TextField (macOS)
 
-/// An AppKit-backed text field without a visible focus ring, bridged into SwiftUI.
-///
-/// - Mirrors text changes back to the bound `text` using an `NSTextFieldDelegate`.
-/// - Optionally requests first responder once when `isFocused` becomes true.
 struct FocusRinglessTextField: NSViewRepresentable {
     final class Coordinator: NSObject, NSTextFieldDelegate {
         var parent: FocusRinglessTextField
         init(_ parent: FocusRinglessTextField) { self.parent = parent }
 
-        /// Syncs the NSTextField's current string back to the SwiftUI binding.
         func controlTextDidChange(_ obj: Notification) {
             guard let field = obj.object as? NSTextField else { return }
             if parent.text != field.stringValue {
@@ -205,12 +178,13 @@ struct FocusRinglessTextField: NSViewRepresentable {
         }
         nsView.focusRingType = .none
 
-        // Only become first responder once when requested and not already editing
         if isFocused,
            nsView.window != nil,
            nsView.currentEditor() == nil,
            nsView.acceptsFirstResponder {
-            nsView.becomeFirstResponder()
+            DispatchQueue.main.async {
+                nsView.becomeFirstResponder()
+            }
         }
     }
 
@@ -219,13 +193,6 @@ struct FocusRinglessTextField: NSViewRepresentable {
 
 // MARK: - ContentView
 
-/// Main content listing clipboard items with search, hover highlight, keyboard navigation, and actions.
-///
-/// Behavior:
-/// - Filters items by `searchText`.
-/// - Arrow keys move selection; Return copies; Escape clears or closes the panel.
-/// - Hovering a row selects it for visual highlight.
-/// - Selecting/copying/pasting closes the floating history window.
 struct ContentView: View {
     @EnvironmentObject var itemsVM: ItemsViewModel
     @State private var searchText: String = ""
@@ -240,19 +207,30 @@ struct ContentView: View {
     @State private var keyboardNavigated: Bool = false
     private let copyHighlightDuration: TimeInterval = 0.6
 
-    // Filtered items (debounced search)
-    private var filteredItems: [ClipItem] {
-        let base = itemsVM.items
-        let q = debouncedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !q.isEmpty else { return base }
-        return base.filter { $0.text.localizedCaseInsensitiveContains(q) }
+    /// Single-pass snapshot of items split into pinned/unpinned display buckets.
+    /// Replaces the previous seven-stage cascade; one O(n) walk + one prefix.
+    private struct Snapshot {
+        var ordered: [ClipItem]
+        var displayPinned: [ClipItem]
+        var displayUnpinned: [ClipItem]
+        var displayItems: [ClipItem] { displayPinned + displayUnpinned }
     }
-    private var pinnedItems: [ClipItem] { filteredItems.filter { $0.pinned } }
-    private var unpinnedItems: [ClipItem] { filteredItems.filter { !$0.pinned } }
-    private var orderedItems: [ClipItem] { pinnedItems + unpinnedItems }
-    private var displayItems: [ClipItem] { Array(orderedItems.prefix(min(visibleLimit, maxVisible))) }
-    private var displayPinned: [ClipItem] { displayItems.filter { $0.pinned } }
-    private var displayUnpinned: [ClipItem] { displayItems.filter { !$0.pinned } }
+
+    private var snapshot: Snapshot {
+        let q = debouncedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        var pinned: [ClipItem] = []
+        var unpinned: [ClipItem] = []
+        for item in itemsVM.items {
+            if !q.isEmpty && !item.text.localizedCaseInsensitiveContains(q) { continue }
+            if item.pinned { pinned.append(item) } else { unpinned.append(item) }
+        }
+        let ordered = pinned + unpinned
+        let limit = min(visibleLimit, maxVisible, ordered.count)
+        let pinnedInDisplay = min(pinned.count, limit)
+        let displayPinned = Array(pinned.prefix(pinnedInDisplay))
+        let displayUnpinned = Array(unpinned.prefix(limit - pinnedInDisplay))
+        return Snapshot(ordered: ordered, displayPinned: displayPinned, displayUnpinned: displayUnpinned)
+    }
 
     private func isRecentlyCopied(_ id: UUID) -> Bool {
         guard let ts = copiedTimestamps[id] else { return false }
@@ -268,15 +246,20 @@ struct ContentView: View {
 
     private enum RowAction { case copy }
     private func perform(action: RowAction, id: UUID) {
-        guard let item = filteredItems.first(where: { $0.id == id }) else { return }
+        guard let item = itemsVM.items.first(where: { $0.id == id }) else { return }
         switch action {
         case .copy:
-            NSPasteboard.general.copyString(item.text)
+            let text = item.text
+            selectedID = id
+            copiedTimestamps[id] = Date()
+            scheduleCopiedCleanup(for: id)
+            HistoryWindowController.shared.close()
+            // Defer slightly so the panel finishes ordering out before we activate the
+            // previous app and synthesize Cmd-V into it.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                AutoPaster.pasteIntoPreviousApp(text: text)
+            }
         }
-        selectedID = id
-        copiedTimestamps[id] = Date()
-        scheduleCopiedCleanup(for: id)
-        HistoryWindowController.shared.close()
     }
 
     @ViewBuilder
@@ -304,8 +287,9 @@ struct ContentView: View {
                 }
             }
             .onAppear {
-                if let last = displayItems.last, last.id == item.id {
-                    let total = orderedItems.count
+                let snap = snapshot
+                if let last = snap.displayItems.last, last.id == item.id {
+                    let total = snap.ordered.count
                     if visibleLimit < min(total, maxVisible) { visibleLimit = min(visibleLimit + 30, min(total, maxVisible)) }
                 }
             }
@@ -314,7 +298,6 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            // Header
             HStack(spacing: 8) {
                 Image(systemName: "doc.on.clipboard").imageScale(.medium).foregroundStyle(.secondary)
                 Text("Clipboard").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
@@ -331,19 +314,20 @@ struct ContentView: View {
             Divider().opacity(0.6).padding(.bottom, 6)
 
             ScrollViewReader { proxy in
+                let snap = snapshot
                 ScrollView {
                     VStack(alignment: .leading, spacing: 8) {
-                        if displayItems.isEmpty {
+                        if snap.displayItems.isEmpty {
                             emptyState
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 6)
                         } else {
                             LazyVStack(alignment: .leading, spacing: 8) {
-                                if !displayPinned.isEmpty {
-                                    rows(for: displayPinned)
+                                if !snap.displayPinned.isEmpty {
+                                    rows(for: snap.displayPinned)
                                     Divider().opacity(0.6).padding(.vertical, 2)
                                 }
-                                rows(for: displayUnpinned)
+                                rows(for: snap.displayUnpinned)
                             }
                             .padding(.horizontal, 7)
                             .padding(.bottom, 56)
@@ -398,13 +382,16 @@ struct ContentView: View {
             .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color(NSColor.controlBackgroundColor)))
             .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Color.white.opacity(0.06)))
 
-            Button(role: .destructive, action: { clearHistory(removePinned: false) }) {
+            Button(role: .destructive) {
+                let alsoPinned = NSEvent.modifierFlags.contains(.option)
+                clearHistory(removePinned: alsoPinned)
+            } label: {
                 Image(systemName: "trash"); Text("Clear")
             }
             .font(.footnote)
             .buttonStyle(.bordered)
             .controlSize(.small)
-            .help("Clear unpinned items")
+            .help("Clear unpinned items (⌥-click to include pinned)")
         }
     }
 
@@ -415,21 +402,22 @@ struct ContentView: View {
         searchText = ""
     }
 
-    // Keyboard: Up/Down selects, Return copies selected (and closes), Esc clears or closes
     private func handleKeyEvent(_ event: NSEvent) {
         switch event.keyCode {
         case KeyCode.down:
-            guard !orderedItems.isEmpty else { return }
+            let ordered = snapshot.ordered
+            guard !ordered.isEmpty else { return }
             keyboardNavigated = true
-            if let currentID = selectedID, let idx = orderedItems.firstIndex(where: { $0.id == currentID }) {
-                selectedID = orderedItems[min(idx + 1, orderedItems.count - 1)].id
-            } else { selectedID = orderedItems.first?.id }
+            if let currentID = selectedID, let idx = ordered.firstIndex(where: { $0.id == currentID }) {
+                selectedID = ordered[min(idx + 1, ordered.count - 1)].id
+            } else { selectedID = ordered.first?.id }
         case KeyCode.up:
-            guard !orderedItems.isEmpty else { return }
+            let ordered = snapshot.ordered
+            guard !ordered.isEmpty else { return }
             keyboardNavigated = true
-            if let currentID = selectedID, let idx = orderedItems.firstIndex(where: { $0.id == currentID }) {
-                selectedID = orderedItems[max(idx - 1, 0)].id
-            } else { selectedID = orderedItems.last?.id }
+            if let currentID = selectedID, let idx = ordered.firstIndex(where: { $0.id == currentID }) {
+                selectedID = ordered[max(idx - 1, 0)].id
+            } else { selectedID = ordered.last?.id }
         case KeyCode.return:
             if let id = selectedID { perform(action: .copy, id: id) }
         case KeyCode.escape:
@@ -441,12 +429,6 @@ struct ContentView: View {
 
 // MARK: - ClipRow View
 
-/// A single clipboard entry row displaying text, pin state, timestamp, and quick actions.
-///
-/// Visual states:
-/// - Hovered: subtle background and higher control opacity
-/// - Selected: accent-tinted background
-/// - Copied: green-tinted background
 struct ClipRow: View {
     let item: ClipItem
     var isSelected: Bool
@@ -464,13 +446,14 @@ struct ClipRow: View {
     private var timeString: String { Self.formatter.string(from: item.date) }
 
     private var titleText: some View {
+        // No textSelection — it would swallow row clicks and expand the row in selection mode.
         Text(item.text)
             .lineLimit(2)
             .truncationMode(.tail)
             .font(.system(size: 13))
             .foregroundColor(.primary)
-            .textSelection(.enabled)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .allowsHitTesting(false)
     }
 
     private var pinBadge: some View {
@@ -541,7 +524,7 @@ struct ClipRow: View {
                 .font(.system(size: 11, weight: .semibold))
         }
         .buttonStyle(.plain)
-        .help("Copy to Clipboard")
+        .help("Copy to clipboard (no auto-paste). Click the row to copy and paste.")
     }
 
     private var trailingActions: some View {
@@ -599,38 +582,58 @@ struct ClipRow: View {
 
 // MARK: - History Window Controller
 
-/// Manages the non-activating floating panel that hosts the history UI.
-///
-/// Responsibilities:
-/// - Create and configure an `NSPanel` with transparent background and rounded content.
-/// - Position the panel near a screen point.
-/// - Install a global mouse-down monitor to close when clicking outside.
-/// - Provide a shared singleton for easy access.
 final class HistoryWindowController: NSObject, NSWindowDelegate {
     static let shared = HistoryWindowController()
 
     private var window: NSPanel?
+    private var hostingView: NSHostingView<SharedHistoryRootView>?
     private var outsideClickMonitor: Any?
 
     private override init() {}
 
-    /// Shows the panel if hidden or closes it if visible.
+    /// Build the panel and force SwiftUI's first render off-screen so the user-visible
+    /// first show is instant. Call once after the ItemsViewModel is ready.
+    func prewarm(itemsVM: ItemsViewModel) {
+        let panel = ensurePanel(itemsVM: itemsVM)
+        panel.setFrameOrigin(NSPoint(x: -20000, y: -20000))
+        panel.alphaValue = 0
+        panel.orderFront(nil)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            panel.orderOut(nil)
+            panel.alphaValue = 1
+        }
+    }
+
     func toggle(at screenPoint: NSPoint, itemsVM: ItemsViewModel) {
-        if let win = window, win.isVisible {
+        if let win = window, win.isVisible, win.alphaValue > 0 {
             close()
         } else {
             show(at: screenPoint, itemsVM: itemsVM)
         }
     }
 
-    /// Creates and presents the floating history panel at a position near `screenPoint`.
     func show(at screenPoint: NSPoint, itemsVM: ItemsViewModel) {
-        // Use the same shared root view used by MenuBarExtra
+        let panel = ensurePanel(itemsVM: itemsVM)
+        panel.alphaValue = 1
+        positionPanel(panel, at: screenPoint)
+
+        // ignoringOtherApps: true reliably activates LSUIElement apps (clicking the
+        // status item alone often isn't enough). AutoPaster filters self-activations,
+        // so the user's previous foreground app is preserved as the paste target.
+        NSApp.activate(ignoringOtherApps: true)
+        panel.makeKeyAndOrderFront(nil)
+
+        installOutsideClickMonitor()
+    }
+
+    private func ensurePanel(itemsVM: ItemsViewModel) -> NSPanel {
+        if let existing = window { return existing }
+
         let hosting = NSHostingView(rootView: SharedHistoryRootView(itemsVM: itemsVM))
         hosting.translatesAutoresizingMaskIntoConstraints = false
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: HistoryUI.panelWidth, height: HistoryUI.panelHeight),
+            contentRect: NSRect(x: 0, y: 0, width: 340, height: 500),
             styleMask: [.nonactivatingPanel, .fullSizeContentView, .titled],
             backing: .buffered,
             defer: false
@@ -642,15 +645,18 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
         panel.standardWindowButton(.zoomButton)?.isHidden = true
         panel.isMovableByWindowBackground = true
         panel.isFloatingPanel = true
-        panel.hidesOnDeactivate = true
+        // No hidesOnDeactivate — the global outside-click monitor is our single source
+        // of truth for "click outside → close." Two mechanisms would race.
+        panel.hidesOnDeactivate = false
         panel.level = .floating
         panel.collectionBehavior = [.transient, .ignoresCycle]
         panel.isOpaque = false
         panel.hasShadow = false
         panel.backgroundColor = .clear
         panel.delegate = self
-        panel.animationBehavior = .utilityWindow
-        panel.becomesKeyOnlyIfNeeded = true
+        // .none avoids the fade-in delay on show. The panel is meant to feel instant.
+        panel.animationBehavior = .none
+        panel.becomesKeyOnlyIfNeeded = false
         panel.isReleasedWhenClosed = false
 
         let containerView = NSView()
@@ -663,40 +669,35 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
             hosting.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
             hosting.topAnchor.constraint(equalTo: containerView.topAnchor),
             hosting.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
-            containerView.widthAnchor.constraint(equalToConstant: HistoryUI.panelWidth),
-            containerView.heightAnchor.constraint(equalToConstant: HistoryUI.panelHeight)
+            containerView.widthAnchor.constraint(equalToConstant: 340),
+            containerView.heightAnchor.constraint(equalToConstant: 500)
         ])
 
-        if let screen = NSScreen.main {
-            let halfW: CGFloat = HistoryUI.panelWidth / 2
-            var origin = NSPoint(x: screenPoint.x - halfW, y: screenPoint.y - 20 - HistoryUI.panelHeight)
-            let visible = screen.visibleFrame
-            origin.x = max(visible.minX + 8, min(origin.x, visible.maxX - HistoryUI.panelWidth - 8))
-            origin.y = max(visible.minY + 8, min(origin.y, visible.maxY - 8))
-            panel.setFrameOrigin(origin)
-        }
-
-        NSApp.activate(ignoringOtherApps: false)
-        panel.orderFront(nil)
-
-        installOutsideClickMonitor()
         self.window = panel
+        self.hostingView = hosting
+        return panel
     }
 
-    /// Closes the panel and removes any installed outside-click monitor.
+    private func positionPanel(_ panel: NSPanel, at screenPoint: NSPoint) {
+        guard let screen = NSScreen.main else { return }
+        let halfW: CGFloat = 170
+        var origin = NSPoint(x: screenPoint.x - halfW, y: screenPoint.y - 20 - 500)
+        let visible = screen.visibleFrame
+        origin.x = max(visible.minX + 8, min(origin.x, visible.maxX - 340 - 8))
+        origin.y = max(visible.minY + 8, min(origin.y, visible.maxY - 8))
+        panel.setFrameOrigin(origin)
+    }
+
     func close() {
-        if let win = window {
-            win.orderOut(nil)
-            removeOutsideClickMonitor()
-        }
-        window = nil
+        window?.orderOut(nil)
+        removeOutsideClickMonitor()
+        // Intentionally keep `window` and `hostingView` for reuse — that's the perf win.
     }
 
     func windowWillClose(_ notification: Notification) {
         removeOutsideClickMonitor()
     }
 
-    /// Installs a global mouse-down monitor that closes the panel when the user clicks outside it.
     private func installOutsideClickMonitor() {
         outsideClickMonitor.map(NSEvent.removeMonitor)
         outsideClickMonitor = nil
@@ -711,3 +712,427 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
     }
 }
 
+// MARK: - Menu Bar Controller (status item + right-click menu)
+
+final class MenuBarController: NSObject {
+    private let statusItem: NSStatusItem
+    private let itemsVM: ItemsViewModel
+    private let onShortcutChanged: () -> Void
+    private var activeRecorder: HotkeyRecorder?
+
+    init(itemsVM: ItemsViewModel, onShortcutChanged: @escaping () -> Void) {
+        self.itemsVM = itemsVM
+        self.onShortcutChanged = onShortcutChanged
+        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        super.init()
+
+        guard let button = statusItem.button else { return }
+        button.image = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "Clipboard")
+        button.target = self
+        button.action = #selector(handleClick(_:))
+        button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+    }
+
+    @objc private func handleClick(_ sender: NSStatusBarButton) {
+        let event = NSApp.currentEvent
+        let type = event?.type
+        let isCtrl = event?.modifierFlags.contains(.control) ?? false
+        if type == .rightMouseUp || (type == .leftMouseUp && isCtrl) {
+            showContextMenu()
+        } else {
+            // Capture the user's foreground app BEFORE the panel activation pulls focus to us.
+            AutoPaster.captureFrontmost()
+            toggleHistory()
+        }
+    }
+
+    private func toggleHistory() {
+        HistoryWindowController.shared.toggle(at: NSEvent.mouseLocation, itemsVM: itemsVM)
+    }
+
+    private func showContextMenu() {
+        let menu = NSMenu()
+
+        if !AXIsProcessTrusted() {
+            let ax = NSMenuItem(title: "Enable Auto-Paste (Accessibility)…",
+                                action: #selector(menuOpenAccessibilitySettings),
+                                keyEquivalent: "")
+            ax.target = self
+            menu.addItem(ax)
+            menu.addItem(.separator())
+        }
+
+        let shortcut = NSMenuItem(title: "Set Shortcut…", action: #selector(menuSetShortcut), keyEquivalent: "")
+        shortcut.target = self
+        menu.addItem(shortcut)
+
+        let launch = NSMenuItem(title: "Launch at Login", action: #selector(menuToggleLaunchAtLogin), keyEquivalent: "")
+        launch.target = self
+        launch.state = Preferences.shared.launchAtLogin ? .on : .off
+        menu.addItem(launch)
+
+        menu.addItem(.separator())
+
+        let about = NSMenuItem(title: "About Clip Board", action: #selector(menuShowAbout), keyEquivalent: "")
+        about.target = self
+        menu.addItem(about)
+
+        let quit = NSMenuItem(title: "Quit Clip Board", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        quit.target = NSApp
+        menu.addItem(quit)
+
+        if let button = statusItem.button {
+            let point = NSPoint(x: 0, y: button.bounds.height + 4)
+            menu.popUp(positioning: nil, at: point, in: button)
+            // popUp can reset the cell's action mask; restore so left-click keeps firing.
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        }
+    }
+
+    @objc private func menuOpenAccessibilitySettings() {
+        let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc private func menuShowAbout() {
+        NSApp.activate(ignoringOtherApps: true)
+        NSApp.orderFrontStandardAboutPanel(nil)
+    }
+
+    @objc private func menuToggleLaunchAtLogin() {
+        Preferences.shared.launchAtLogin.toggle()
+    }
+
+    @objc private func menuSetShortcut() {
+        let recorder = HotkeyRecorder(
+            initial: Preferences.shared.hotkey,
+            onSave: { [weak self] keyCode, modifiers in
+                Preferences.shared.hotkey = .init(keyCode: keyCode, modifiers: modifiers)
+                self?.onShortcutChanged()
+            },
+            onClose: { [weak self] in
+                self?.activeRecorder = nil
+            }
+        )
+        recorder.show()
+        self.activeRecorder = recorder
+    }
+}
+
+// MARK: - Hotkey Recorder
+
+final class HotkeyRecorder: NSObject, NSWindowDelegate {
+    private var window: NSWindow?
+    private var monitor: Any?
+    private let model = RecorderModel()
+    private let onSave: (UInt32, UInt32) -> Void   // Carbon keyCode, Carbon modifiers
+    private let onClose: () -> Void
+
+    init(initial: Preferences.HotkeyConfig,
+         onSave: @escaping (UInt32, UInt32) -> Void,
+         onClose: @escaping () -> Void) {
+        self.onSave = onSave
+        self.onClose = onClose
+        super.init()
+        let initialFlags = HotkeyDisplay.nsFlags(fromCarbon: initial.modifiers)
+        model.display = HotkeyDisplay.string(carbonKeyCode: initial.keyCode, carbonModifiers: initial.modifiers)
+        model.conflict = HotkeyConflict.description(keyCode: UInt16(initial.keyCode), flags: initialFlags)
+    }
+
+    func show() {
+        let host = NSHostingView(rootView: RecorderView(
+            model: model,
+            onCancel: { [weak self] in self?.closeWindow() },
+            onSave: { [weak self] in
+                guard let self, let captured = self.model.captured else { return }
+                self.onSave(UInt32(captured.keyCode), HotkeyDisplay.carbonModifiers(from: captured.flags))
+                self.closeWindow()
+            }
+        ))
+        host.frame = NSRect(x: 0, y: 0, width: 380, height: 200)
+
+        let w = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 380, height: 200),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        w.title = "Set Shortcut"
+        w.contentView = host
+        w.center()
+        w.isReleasedWhenClosed = false
+        w.delegate = self
+        w.level = .modalPanel
+
+        // Local monitor only fires while this app is key — the window is key by then.
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, NSApp.keyWindow == self.window else { return event }
+            let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            // Esc with no modifier cancels — common dialog convention.
+            if event.keyCode == UInt16(kVK_Escape) && mods.isEmpty {
+                self.closeWindow()
+                return nil
+            }
+            let required: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
+            // Ignore plain key presses (no modifier) — a global hotkey without modifiers
+            // would be a usability disaster (intercepts every typed key).
+            if mods.isDisjoint(with: required) {
+                self.model.display = "Press a modifier + key"
+                return nil
+            }
+            self.model.captured = .init(keyCode: event.keyCode, flags: mods)
+            self.model.display = HotkeyDisplay.string(keyCode: event.keyCode, flags: mods)
+            self.model.conflict = HotkeyConflict.description(keyCode: event.keyCode, flags: mods)
+            return nil
+        }
+
+        self.window = w
+        NSApp.activate(ignoringOtherApps: true)
+        w.makeKeyAndOrderFront(nil)
+    }
+
+    private func closeWindow() {
+        window?.close()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        if let m = monitor { NSEvent.removeMonitor(m) }
+        monitor = nil
+        window = nil
+        onClose()
+    }
+}
+
+private final class RecorderModel: ObservableObject {
+    struct Captured: Equatable {
+        let keyCode: UInt16
+        let flags: NSEvent.ModifierFlags
+    }
+    @Published var display: String = "Press a modifier + key"
+    @Published var captured: Captured?
+    @Published var conflict: String?
+}
+
+private struct RecorderView: View {
+    @ObservedObject var model: RecorderModel
+    var onCancel: () -> Void
+    var onSave: () -> Void
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Text("Set Global Shortcut")
+                .font(.headline)
+            Text("Hold one or more modifier keys (⌘ ⌥ ⌃ ⇧) and press a key.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+
+            VStack(spacing: 6) {
+                Text(model.display)
+                    .font(.system(size: 28, weight: .semibold, design: .rounded))
+                    .frame(maxWidth: .infinity, minHeight: 56)
+                    .background(RoundedRectangle(cornerRadius: 10).fill(Color.secondary.opacity(0.12)))
+
+                // Conflict indicator — orange (warning), not red (error). Always reserves
+                // vertical space so the layout doesn't jump when conflict appears/clears.
+                HStack(spacing: 6) {
+                    if let conflict = model.conflict {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        Text(conflict)
+                    } else {
+                        Text(" ")
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(model.conflict == nil ? Color.clear : Color.orange)
+                .frame(maxWidth: .infinity, alignment: .center)
+                .frame(height: 16)
+            }
+
+            HStack {
+                Button("Cancel", action: onCancel)
+                Spacer()
+                Button("Save", action: onSave)
+                    .disabled(model.captured == nil)
+            }
+        }
+        .padding(20)
+        .frame(width: 380)
+    }
+}
+
+// MARK: - Hotkey Conflict Detection
+
+/// Curated catalog of well-known macOS / common-app shortcuts. Returns a short
+/// description when the candidate combo matches a known conflict, otherwise nil.
+///
+/// This is intentionally a hand-maintained list of high-impact combos, not an
+/// exhaustive system query (no stable public API exposes user-configured system
+/// shortcuts). Covers what users would realistically try first.
+private enum HotkeyConflict {
+    static func description(keyCode: UInt16, flags: NSEvent.ModifierFlags) -> String? {
+        let cmd   = flags.contains(.command)
+        let opt   = flags.contains(.option)
+        let ctrl  = flags.contains(.control)
+        let shift = flags.contains(.shift)
+        let kc    = Int(keyCode)
+
+        // ⌘ alone — single-key Cmd shortcuts used by virtually every macOS app.
+        if cmd && !opt && !ctrl && !shift {
+            switch kc {
+            case kVK_ANSI_C: return "Conflicts with Copy"
+            case kVK_ANSI_V: return "Conflicts with Paste"
+            case kVK_ANSI_X: return "Conflicts with Cut"
+            case kVK_ANSI_A: return "Conflicts with Select All"
+            case kVK_ANSI_Z: return "Conflicts with Undo"
+            case kVK_ANSI_N: return "Conflicts with New (most apps)"
+            case kVK_ANSI_O: return "Conflicts with Open (most apps)"
+            case kVK_ANSI_S: return "Conflicts with Save (most apps)"
+            case kVK_ANSI_W: return "Conflicts with Close Window / Tab"
+            case kVK_ANSI_Q: return "Conflicts with Quit Application"
+            case kVK_ANSI_T: return "Conflicts with New Tab (most apps)"
+            case kVK_ANSI_F: return "Conflicts with Find (most apps)"
+            case kVK_ANSI_G: return "Conflicts with Find Next"
+            case kVK_ANSI_P: return "Conflicts with Print"
+            case kVK_ANSI_M: return "Conflicts with Minimize Window"
+            case kVK_ANSI_H: return "Conflicts with Hide Application"
+            case kVK_Space:  return "Conflicts with Spotlight Search"
+            case kVK_Tab:    return "Conflicts with App Switcher"
+            case kVK_ANSI_Comma:  return "Conflicts with Settings"
+            case kVK_ANSI_Period: return "Conflicts with Cancel (⌘.)"
+            case kVK_Return:      return "Conflicts with Default Action"
+            case kVK_ANSI_Grave:  return "Conflicts with Cycle Windows In App"
+            case kVK_ANSI_L: return "Conflicts with Focus Address Bar (browsers)"
+            case kVK_ANSI_K: return "Conflicts with Command Palette (many apps)"
+            default: break
+            }
+        }
+
+        // ⌘⇧ combos
+        if cmd && shift && !opt && !ctrl {
+            switch kc {
+            case kVK_ANSI_Z: return "Conflicts with Redo"
+            case kVK_ANSI_3: return "Conflicts with Screenshot (Full Screen)"
+            case kVK_ANSI_4: return "Conflicts with Screenshot (Selection)"
+            case kVK_ANSI_5: return "Conflicts with Screenshot Tool"
+            case kVK_ANSI_V: return "Conflicts with Paste & Match Style (many apps)"
+            case kVK_ANSI_N: return "Conflicts with New Folder (Finder)"
+            case kVK_ANSI_A: return "Conflicts with Show Applications (Finder)"
+            case kVK_ANSI_D: return "Conflicts with Show Desktop"
+            case kVK_ANSI_Q: return "Conflicts with Log Out"
+            case kVK_ANSI_T: return "Conflicts with Reopen Last Closed Tab"
+            case kVK_ANSI_G: return "Conflicts with Find Previous"
+            case kVK_ANSI_P: return "Conflicts with Tab Search (browsers)"
+            default: break
+            }
+        }
+
+        // ⌘⌥ combos
+        if cmd && opt && !shift && !ctrl {
+            switch kc {
+            case kVK_Escape:  return "Conflicts with Force Quit"
+            case kVK_ANSI_H:  return "Conflicts with Hide Others"
+            case kVK_ANSI_M:  return "Conflicts with Minimize All"
+            case kVK_ANSI_W:  return "Conflicts with Close All Windows"
+            case kVK_Space:   return "Conflicts with Finder Search"
+            case kVK_ANSI_D:  return "Conflicts with Toggle Dock Hiding"
+            default: break
+            }
+        }
+
+        // ⌘⌃ combos
+        if cmd && ctrl && !opt && !shift {
+            switch kc {
+            case kVK_ANSI_Q: return "Conflicts with Lock Screen"
+            case kVK_ANSI_F: return "Conflicts with Full Screen (many apps)"
+            case kVK_Space:  return "Conflicts with Emoji & Symbols"
+            default: break
+            }
+        }
+
+        // ⌃ alone
+        if ctrl && !cmd && !opt && !shift {
+            switch kc {
+            case kVK_Space: return "Conflicts with Input Source Switch"
+            case kVK_F2:    return "Conflicts with Focus Menu Bar"
+            case kVK_F3:    return "Conflicts with Mission Control"
+            case kVK_F4:    return "Conflicts with Launchpad / App Exposé"
+            default: break
+            }
+        }
+
+        // ⌘⌥⇧ combos
+        if cmd && opt && shift && !ctrl {
+            switch kc {
+            case kVK_ANSI_V: return "Conflicts with Paste & Match Style (many apps)"
+            default: break
+            }
+        }
+
+        return nil
+    }
+}
+
+// MARK: - Hotkey Display Helpers
+
+private enum HotkeyDisplay {
+    static func carbonModifiers(from flags: NSEvent.ModifierFlags) -> UInt32 {
+        var mods: UInt32 = 0
+        if flags.contains(.command)  { mods |= UInt32(cmdKey) }
+        if flags.contains(.option)   { mods |= UInt32(optionKey) }
+        if flags.contains(.control)  { mods |= UInt32(controlKey) }
+        if flags.contains(.shift)    { mods |= UInt32(shiftKey) }
+        return mods
+    }
+
+    static func nsFlags(fromCarbon mods: UInt32) -> NSEvent.ModifierFlags {
+        var flags: NSEvent.ModifierFlags = []
+        if mods & UInt32(cmdKey)     != 0 { flags.insert(.command) }
+        if mods & UInt32(optionKey)  != 0 { flags.insert(.option) }
+        if mods & UInt32(controlKey) != 0 { flags.insert(.control) }
+        if mods & UInt32(shiftKey)   != 0 { flags.insert(.shift) }
+        return flags
+    }
+
+    static func string(keyCode: UInt16, flags: NSEvent.ModifierFlags) -> String {
+        var parts: [String] = []
+        if flags.contains(.control) { parts.append("⌃") }
+        if flags.contains(.option)  { parts.append("⌥") }
+        if flags.contains(.shift)   { parts.append("⇧") }
+        if flags.contains(.command) { parts.append("⌘") }
+        parts.append(keyName(for: keyCode))
+        return parts.joined()
+    }
+
+    static func string(carbonKeyCode: UInt32, carbonModifiers: UInt32) -> String {
+        string(keyCode: UInt16(carbonKeyCode), flags: nsFlags(fromCarbon: carbonModifiers))
+    }
+
+    private static let keyNameMap: [UInt16: String] = [
+        UInt16(kVK_ANSI_A): "A", UInt16(kVK_ANSI_B): "B", UInt16(kVK_ANSI_C): "C",
+        UInt16(kVK_ANSI_D): "D", UInt16(kVK_ANSI_E): "E", UInt16(kVK_ANSI_F): "F",
+        UInt16(kVK_ANSI_G): "G", UInt16(kVK_ANSI_H): "H", UInt16(kVK_ANSI_I): "I",
+        UInt16(kVK_ANSI_J): "J", UInt16(kVK_ANSI_K): "K", UInt16(kVK_ANSI_L): "L",
+        UInt16(kVK_ANSI_M): "M", UInt16(kVK_ANSI_N): "N", UInt16(kVK_ANSI_O): "O",
+        UInt16(kVK_ANSI_P): "P", UInt16(kVK_ANSI_Q): "Q", UInt16(kVK_ANSI_R): "R",
+        UInt16(kVK_ANSI_S): "S", UInt16(kVK_ANSI_T): "T", UInt16(kVK_ANSI_U): "U",
+        UInt16(kVK_ANSI_V): "V", UInt16(kVK_ANSI_W): "W", UInt16(kVK_ANSI_X): "X",
+        UInt16(kVK_ANSI_Y): "Y", UInt16(kVK_ANSI_Z): "Z",
+        UInt16(kVK_ANSI_0): "0", UInt16(kVK_ANSI_1): "1", UInt16(kVK_ANSI_2): "2",
+        UInt16(kVK_ANSI_3): "3", UInt16(kVK_ANSI_4): "4", UInt16(kVK_ANSI_5): "5",
+        UInt16(kVK_ANSI_6): "6", UInt16(kVK_ANSI_7): "7", UInt16(kVK_ANSI_8): "8",
+        UInt16(kVK_ANSI_9): "9",
+        UInt16(kVK_Space): "␣", UInt16(kVK_Return): "↩", UInt16(kVK_Tab): "⇥",
+        UInt16(kVK_Escape): "⎋", UInt16(kVK_Delete): "⌫",
+        UInt16(kVK_LeftArrow): "←", UInt16(kVK_RightArrow): "→",
+        UInt16(kVK_UpArrow): "↑", UInt16(kVK_DownArrow): "↓",
+        UInt16(kVK_F1): "F1", UInt16(kVK_F2): "F2", UInt16(kVK_F3): "F3",
+        UInt16(kVK_F4): "F4", UInt16(kVK_F5): "F5", UInt16(kVK_F6): "F6",
+        UInt16(kVK_F7): "F7", UInt16(kVK_F8): "F8", UInt16(kVK_F9): "F9",
+        UInt16(kVK_F10): "F10", UInt16(kVK_F11): "F11", UInt16(kVK_F12): "F12",
+    ]
+
+    private static func keyName(for keyCode: UInt16) -> String {
+        keyNameMap[keyCode] ?? "Key(\(keyCode))"
+    }
+}

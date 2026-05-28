@@ -4,6 +4,80 @@ import Foundation
 import CryptoKit
 import Security
 import ServiceManagement
+import Carbon
+import os
+
+// MARK: - Logging
+
+enum Log {
+    static let app          = Logger(subsystem: "com.clipboard.manager", category: "app")
+    static let crypto       = Logger(subsystem: "com.clipboard.manager", category: "crypto")
+    static let persistence  = Logger(subsystem: "com.clipboard.manager", category: "persistence")
+    static let hotkey       = Logger(subsystem: "com.clipboard.manager", category: "hotkey")
+    static let clipboard    = Logger(subsystem: "com.clipboard.manager", category: "clipboard")
+    static let menubar      = Logger(subsystem: "com.clipboard.manager", category: "menubar")
+    static let autopaste    = Logger(subsystem: "com.clipboard.manager", category: "autopaste")
+}
+
+// MARK: - Preferences
+
+final class Preferences {
+    static let shared = Preferences()
+    private init() {}
+    private let defaults = UserDefaults.standard
+
+    private enum Keys {
+        static let hotkeyCode    = "hotkey.keyCode"
+        static let hotkeyMods    = "hotkey.modifiers"
+        static let launchAtLogin = "launchAtLogin"
+    }
+
+    struct HotkeyConfig: Equatable {
+        var keyCode: UInt32     // Carbon virtual key code
+        var modifiers: UInt32   // Carbon modifier mask (cmdKey | optionKey | ...)
+    }
+
+    static let defaultHotkey = HotkeyConfig(
+        keyCode: UInt32(kVK_ANSI_V),
+        modifiers: UInt32(controlKey) | UInt32(optionKey) | UInt32(cmdKey)
+    )
+
+    var hotkey: HotkeyConfig {
+        get {
+            let k = (defaults.object(forKey: Keys.hotkeyCode) as? Int).map(UInt32.init) ?? Self.defaultHotkey.keyCode
+            let m = (defaults.object(forKey: Keys.hotkeyMods) as? Int).map(UInt32.init) ?? Self.defaultHotkey.modifiers
+            return HotkeyConfig(keyCode: k, modifiers: m)
+        }
+        set {
+            defaults.set(Int(newValue.keyCode), forKey: Keys.hotkeyCode)
+            defaults.set(Int(newValue.modifiers), forKey: Keys.hotkeyMods)
+        }
+    }
+
+    var launchAtLogin: Bool {
+        get { defaults.object(forKey: Keys.launchAtLogin) as? Bool ?? true }
+        set {
+            defaults.set(newValue, forKey: Keys.launchAtLogin)
+            applyLaunchAtLogin(newValue)
+        }
+    }
+
+    func syncLaunchAtLoginOnStartup() {
+        applyLaunchAtLogin(launchAtLogin)
+    }
+
+    private func applyLaunchAtLogin(_ on: Bool) {
+        guard #available(macOS 13.0, *) else { return }
+        let alreadyOn = (SMAppService.mainApp.status == .enabled)
+        guard alreadyOn != on else { return }
+        do {
+            if on { try SMAppService.mainApp.register() }
+            else  { try SMAppService.mainApp.unregister() }
+        } catch {
+            Log.app.error("Launch-at-login toggle failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+}
 
 // MARK: - KeyManager
 
@@ -59,8 +133,7 @@ final class KeyManager {
         let key = try getOrLoadKey()
         do {
             let sealedBox = try AES.GCM.SealedBox(combined: encryptedData)
-            let decrypted = try AES.GCM.open(sealedBox, using: key)
-            return decrypted
+            return try AES.GCM.open(sealedBox, using: key)
         } catch {
             throw KeyManagerError.decryptionFailed
         }
@@ -115,6 +188,12 @@ final class PersistenceManager {
     private init() {}
 
     private let fileName = "history.json.enc"
+    private let currentSchemaVersion = 1
+
+    struct HistoryFile: Codable {
+        let version: Int
+        let items: [ClipItem]
+    }
 
     private static let encoder: JSONEncoder = {
         let e = JSONEncoder()
@@ -140,94 +219,133 @@ final class PersistenceManager {
                     .posixPermissions: 0o700
                 ])
             } catch {
-                print("⚠️ Failed to create app support folder: \(error)")
+                Log.persistence.error("Failed to create app support folder: \(error.localizedDescription, privacy: .public)")
             }
         }
         return folder.appendingPathComponent(fileName)
     }
 
+    /// Caller must invoke on the main thread (items is snapshotted before async I/O).
     func save(items: [ClipItem]) {
         let url = fileURL
+        let snapshot = items
+        let version = currentSchemaVersion
         ioQueue.async {
             do {
-                let jsonData = try PersistenceManager.encoder.encode(items)
+                let file = HistoryFile(version: version, items: snapshot)
+                let jsonData = try PersistenceManager.encoder.encode(file)
                 let encrypted = try KeyManager.shared.encrypt(data: jsonData)
                 try encrypted.write(to: url, options: .atomic)
-                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
             } catch {
-                print("⚠️ Failed to save history: \(error)")
+                Log.persistence.error("Save failed: \(error.localizedDescription, privacy: .public)")
             }
         }
     }
 
     func load() -> [ClipItem] {
+        let url = fileURL
+        guard FileManager.default.fileExists(atPath: url.path) else { return [] }
+        let data: Data
         do {
-            let data = try Data(contentsOf: fileURL)
-            let decrypted = try KeyManager.shared.decrypt(data)
-            let items = try PersistenceManager.decoder.decode([ClipItem].self, from: decrypted)
-            return items
+            data = try Data(contentsOf: url)
         } catch {
+            Log.persistence.error("Failed to read history file: \(error.localizedDescription, privacy: .public)")
             return []
+        }
+        let decrypted: Data
+        do {
+            decrypted = try KeyManager.shared.decrypt(data)
+        } catch {
+            Log.persistence.error("Decrypt failed; quarantining file. \(error.localizedDescription, privacy: .public)")
+            quarantine(url: url)
+            return []
+        }
+        if let file = try? Self.decoder.decode(HistoryFile.self, from: decrypted) {
+            return file.items
+        }
+        if let legacy = try? Self.decoder.decode([ClipItem].self, from: decrypted) {
+            Log.persistence.info("Migrated legacy history (unversioned).")
+            return legacy
+        }
+        Log.persistence.error("History payload not decodable; quarantining.")
+        quarantine(url: url)
+        return []
+    }
+
+    private func quarantine(url: URL) {
+        let ts = Int(Date().timeIntervalSince1970)
+        let target = url.deletingLastPathComponent().appendingPathComponent("history.broken-\(ts)")
+        do {
+            try FileManager.default.moveItem(at: url, to: target)
+            Log.persistence.info("Quarantined corrupt history to \(target.lastPathComponent, privacy: .public)")
+        } catch {
+            Log.persistence.error("Quarantine failed: \(error.localizedDescription, privacy: .public)")
         }
     }
 }
 
-// MARK: - App Entry
+// MARK: - App Delegate & Entry
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private(set) var itemsVM: ItemsViewModel!
+    private var menuBarController: MenuBarController?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        // 1. Encryption key must exist before persistence load.
+        do { try KeyManager.shared.ensureKeyExists() }
+        catch { Log.crypto.error("ensureKeyExists failed: \(error.localizedDescription, privacy: .public)") }
+
+        // 2. Load persisted history.
+        itemsVM = ItemsViewModel()
+
+        // 3. Sync launch-at-login with stored preference (idempotent; no-op when matched).
+        Preferences.shared.syncLaunchAtLoginOnStartup()
+
+        // 4. Track frontmost app for auto-paste target.
+        AutoPaster.startTracking()
+
+        // 5. Start clipboard watcher.
+        ClipboardWatcher.shared.start { [weak self] text in
+            self?.itemsVM?.addItem(text)
+        }
+
+        // 6. Register hotkey from preferences (no UI interaction needed).
+        registerHotkeyFromPreferences()
+
+        // 7. Install status item + right-click menu.
+        menuBarController = MenuBarController(
+            itemsVM: itemsVM,
+            onShortcutChanged: { [weak self] in self?.registerHotkeyFromPreferences() }
+        )
+
+        // 8. Pre-warm the floating panel so the first user-visible show is instant
+        //    (NSPanel + NSHostingView + SwiftUI first-render is the expensive part).
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let vm = self?.itemsVM else { return }
+            HistoryWindowController.shared.prewarm(itemsVM: vm)
+        }
+
+        Log.app.info("Launched. Services online.")
+    }
+
+    func registerHotkeyFromPreferences() {
+        let cfg = Preferences.shared.hotkey
+        HotkeyManager.shared.registerHotkey(keyCode: cfg.keyCode, modifiers: cfg.modifiers) { [weak self] in
+            guard let self, let vm = self.itemsVM else { return }
+            // Capture the user's foreground app BEFORE we steal focus by showing the panel.
+            AutoPaster.captureFrontmost()
+            let loc = NSEvent.mouseLocation
+            HistoryWindowController.shared.toggle(at: loc, itemsVM: vm)
+        }
+    }
+}
 
 @main
 struct Clip_BoardApp: App {
-    @StateObject private var itemsVM = ItemsViewModel()
-
-    // Removed @AppStorage toggle to enforce "always start on login"
-    @State private var servicesStarted = false
-
-    init() {
-        do {
-            try KeyManager.shared.ensureKeyExists()
-        } catch {
-            print("⚠️ Failed to setup encryption key: \(error)")
-        }
-
-        // Always start on login (macOS 13+)
-        if #available(macOS 13.0, *) {
-            do {
-                try SMAppService.mainApp.register()
-                print("✅ Launch at login registered")
-            } catch {
-                print("⚠️ Failed to register launch at login: \(error)")
-            }
-        }
-    }
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
-        MenuBarExtra("Clipboard", systemImage: "doc.on.clipboard") {
-            // Use the same shared root used by the hotkey window
-            SharedHistoryRootView(itemsVM: itemsVM)
-                .onAppear(perform: startServicesIfNeeded)
-        }
-        .menuBarExtraStyle(.window)
-    }
-
-    private func startServicesIfNeeded() {
-        guard !servicesStarted else { return }
-        servicesStarted = true
-
-        ClipboardWatcher.shared.start { [weak itemsVM] newText in
-            itemsVM?.addItem(newText)
-        }
-
-        HotkeyManager.shared.registerHotkey { [weak itemsVM] in
-            guard let itemsVM else { return }
-            let loc = NSEvent.mouseLocation
-            HistoryWindowController.shared.toggle(at: loc, itemsVM: itemsVM)
-        }
-
-        Clip_BoardApp.syncLaunchAtLoginStatusStatic()
-    }
-
-    static func syncLaunchAtLoginStatusStatic() {
-        if #available(macOS 13.0, *) {
-            _ = SMAppService.mainApp.status
-        }
+        Settings { EmptyView() } // No visible scene; UI lives in the status item / floating panel.
     }
 }
