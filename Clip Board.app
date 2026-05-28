@@ -1,1 +1,0 @@
-../../Library/Developer/Xcode/DerivedData/Clip_Board-dyfdfjyyjjzhonaobgcrezgfsnmh/Build/Intermediates.noindex/ArchiveIntermediates/Clip Board/InstallationBuildProductsLocation/Applications/Clip Board.app
