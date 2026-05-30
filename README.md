@@ -50,15 +50,30 @@ Most clipboard managers either keep your history in plaintext, sync it to a clou
 
 ## Install
 
-### Download the release
+### Homebrew (recommended)
+
+```bash
+brew install --cask light-house-group/tap/clip-board
+```
+
+This adds the `light-house-group/tap` tap once, downloads the signed zip, and installs `Clip Board.app` into `/Applications`. To update later:
+
+```bash
+brew update
+brew upgrade --cask clip-board
+```
+
+To uninstall:
+
+```bash
+brew uninstall --cask clip-board
+```
+
+### Download the release manually
 
 Grab `Clip-Board.zip` from the [latest release](https://github.com/Light-House-Group/Clip-Board/releases/latest), unzip it, and drag `Clip Board.app` into `/Applications`.
 
 The release binary is **ad-hoc signed**, so on first launch macOS Gatekeeper will say it can't be verified. Right-click the app → **Open** → **Open** to bypass the warning the first time. (If you want notarized builds, see [Build from source](#build-from-source) below — a `DEVELOPER_ID` plus `--notarize` flag is all the release script needs.)
-
-### From Homebrew
-
-Not yet — planned once the project has a few releases under it.
 
 ---
 

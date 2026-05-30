@@ -94,7 +94,7 @@ private enum HistoryUI {
     static let panelWidth: CGFloat = 340
     static let panelHeight: CGFloat = 500
     static let contentWidth: CGFloat = 328
-    static let contentHeight: CGFloat = 440
+    static let contentHeight: CGFloat = 408
 
     static let outerPadding: CGFloat = 12
     static let innerHorizontal: CGFloat = 10
@@ -122,14 +122,33 @@ struct SharedHistoryRootView: View {
             // No drag grabber — the entire panel is draggable via
             // `isMovableByWindowBackground`, so the capsule was decorative-only
             // and just pushed real content down.
-            ContentView()
-                .environmentObject(itemsVM)
-                .padding(.horizontal, HistoryUI.innerHorizontal)
-                .padding(.bottom, HistoryUI.innerVertical)
+            VStack(spacing: 0) {
+                ContentView()
+                    .environmentObject(itemsVM)
+                    .padding(.horizontal, HistoryUI.innerHorizontal)
+
+                attributionFooter
+                    .padding(.horizontal, HistoryUI.innerHorizontal)
+                    .padding(.top, 6)
+                    .padding(.bottom, HistoryUI.innerVertical + 2)
+            }
         }
         .padding(HistoryUI.outerPadding)
         .frame(width: HistoryUI.panelWidth, height: HistoryUI.panelHeight)
         .background(Color.clear)
+    }
+
+    /// Centered attribution footer. Quiet styling so it doesn't compete with content.
+    private var attributionFooter: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "doc.on.clipboard")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text("Clip-Board by Siddharth Sangwan")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity)
     }
 }
 
@@ -204,6 +223,39 @@ struct ContentView: View {
     @State private var keyboardNavigated: Bool = false
     private let copyHighlightDuration: TimeInterval = 0.6
 
+    // Multi-select mode — entered via row context-menu "Select".
+    // Click anywhere on a row toggles its selection; no leading checkboxes.
+    @State private var isMultiSelectMode: Bool = false
+    @State private var multiSelectedIDs: Set<UUID> = []
+
+    // System confirmation before Clear destroys a batch of items.
+    private enum ClearScope { case unpinnedOnly, all }
+    @State private var pendingClear: ClearScope? = nil
+
+    private func enterSelectMode(initialID: UUID? = nil) {
+        isMultiSelectMode = true
+        multiSelectedIDs = initialID.map { [$0] } ?? []
+        previewItemID = nil
+        selectedID = nil
+    }
+    private func exitSelectMode() {
+        isMultiSelectMode = false
+        multiSelectedIDs.removeAll()
+    }
+    private func toggleMultiSelection(_ id: UUID) {
+        if multiSelectedIDs.contains(id) { multiSelectedIDs.remove(id) }
+        else { multiSelectedIDs.insert(id) }
+    }
+    private func deleteMultiSelected() {
+        for id in multiSelectedIDs {
+            itemsVM.deleteItem(id)
+            if selectedID == id { selectedID = nil }
+            if previewItemID == id { previewItemID = nil }
+            copiedTimestamps.removeValue(forKey: id)
+        }
+        exitSelectMode()
+    }
+
     /// Single-pass snapshot of items split into pinned/unpinned display buckets.
     /// Replaces the previous seven-stage cascade; one O(n) walk + one prefix.
     private struct Snapshot {
@@ -266,22 +318,38 @@ struct ContentView: View {
                 item: item,
                 isSelected: selectedID == item.id,
                 isCopied: isRecentlyCopied(item.id),
+                isMultiSelectMode: isMultiSelectMode,
+                isMultiSelected: multiSelectedIDs.contains(item.id),
                 previewItemID: $previewItemID
             )
             .id(item.id)
             .contentShape(Rectangle())
-            .onTapGesture { perform(action: .copy, id: item.id) }
+            .onTapGesture {
+                if isMultiSelectMode {
+                    toggleMultiSelection(item.id)
+                } else {
+                    perform(action: .copy, id: item.id)
+                }
+            }
             .onHover { hovering in
                 if hovering { hoverID = item.id; selectedID = item.id } else if hoverID == item.id { hoverID = nil; if selectedID == item.id { selectedID = nil } }
             }
             .contextMenu {
                 Button(item.pinned ? "Unpin" : "Pin") { withAnimation(.easeInOut(duration: 0.15)) { itemsVM.togglePin(item.id) } }
                 Button("Copy") { perform(action: .copy, id: item.id) }
+                Button(isMultiSelectMode ? "Add to Selection" : "Select") {
+                    if isMultiSelectMode {
+                        multiSelectedIDs.insert(item.id)
+                    } else {
+                        enterSelectMode(initialID: item.id)
+                    }
+                }
                 Divider()
                 Button("Delete", role: .destructive) {
                     itemsVM.deleteItem(item.id)
                     if selectedID == item.id { selectedID = nil }
                     if previewItemID == item.id { previewItemID = nil }
+                    multiSelectedIDs.remove(item.id)
                     copiedTimestamps.removeValue(forKey: item.id)
                 }
             }
@@ -297,17 +365,10 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "doc.on.clipboard").imageScale(.medium).foregroundStyle(.secondary)
-                Text("Clipboard").font(.subheadline.weight(.semibold)).foregroundStyle(.secondary)
-                Spacer()
-            }
-            .padding(.horizontal, HistoryUI.innerHorizontal)
-            .padding(.top, 18)
-            .padding(.bottom, 6)
-
+            // "Clipboard" title removed per design — search bar leads the panel.
             searchBar
                 .padding(.horizontal, HistoryUI.innerHorizontal)
+                .padding(.top, 20)
                 .padding(.bottom, 8)
 
             Divider().opacity(0.6).padding(.bottom, 6)
@@ -355,6 +416,27 @@ struct ContentView: View {
             searchDebounceTask = task
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: task)
         }
+        .confirmationDialog(
+            pendingClear == .all ? "Clear all items, including pinned?" : "Clear all unpinned items?",
+            isPresented: Binding(
+                get: { pendingClear != nil },
+                set: { newValue in if !newValue { pendingClear = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button(pendingClear == .all ? "Clear Everything" : "Clear Unpinned", role: .destructive) {
+                let scope = pendingClear
+                pendingClear = nil
+                clearHistory(removePinned: scope == .all)
+            }
+            .keyboardShortcut(.defaultAction) // Enter / Return triggers the destructive action.
+            Button("Cancel", role: .cancel) { pendingClear = nil }
+                .keyboardShortcut(.cancelAction) // Esc cancels.
+        } message: {
+            Text(pendingClear == .all
+                 ? "This permanently removes every clipboard entry, including pinned ones. This cannot be undone."
+                 : "This permanently removes all unpinned clipboard entries. Pinned items will be kept. This cannot be undone.")
+        }
     }
 
     private var emptyState: some View {
@@ -381,16 +463,32 @@ struct ContentView: View {
             .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color(NSColor.controlBackgroundColor)))
             .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).stroke(Color.white.opacity(0.06)))
 
-            Button(role: .destructive) {
-                let alsoPinned = NSEvent.modifierFlags.contains(.option)
-                clearHistory(removePinned: alsoPinned)
-            } label: {
-                Image(systemName: "trash"); Text("Clear")
+            if isMultiSelectMode {
+                Button("Cancel") { exitSelectMode() }
+                    .font(.footnote)
+                    .controlSize(.small)
+                Button(role: .destructive) {
+                    deleteMultiSelected()
+                } label: {
+                    Image(systemName: "trash"); Text("Delete \(multiSelectedIDs.count)")
+                }
+                .font(.footnote)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(multiSelectedIDs.isEmpty)
+                .help("Delete the selected items")
+            } else {
+                Button(role: .destructive) {
+                    let alsoPinned = NSEvent.modifierFlags.contains(.option)
+                    pendingClear = alsoPinned ? .all : .unpinnedOnly
+                } label: {
+                    Image(systemName: "trash"); Text("Clear")
+                }
+                .font(.footnote)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Clear unpinned items (⌥-click to include pinned)")
             }
-            .font(.footnote)
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help("Clear unpinned items (⌥-click to include pinned)")
         }
     }
 
@@ -423,6 +521,7 @@ struct ContentView: View {
             if let id = selectedID { perform(action: .copy, id: id) }
         case KeyCode.escape:
             if previewItemID != nil { previewItemID = nil }
+            else if isMultiSelectMode { exitSelectMode() }
             else if !searchText.isEmpty { searchText = "" }
             else { selectedID = nil; HistoryWindowController.shared.close() }
         default: break
@@ -436,6 +535,8 @@ struct ClipRow: View {
     let item: ClipItem
     var isSelected: Bool
     var isCopied: Bool
+    var isMultiSelectMode: Bool = false
+    var isMultiSelected: Bool = false
     @Binding var previewItemID: UUID?
     @EnvironmentObject var itemsVM: ItemsViewModel
     @State private var isHovered: Bool = false
@@ -515,10 +616,10 @@ struct ClipRow: View {
             }
         }) {
             Image(systemName: item.pinned ? "pin.fill" : "pin")
-                .font(.system(size: 11, weight: .semibold))
+                .font(.system(size: 14, weight: .semibold))
                 .foregroundStyle(item.pinned ? Color.accentColor : .secondary)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 4)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 5)
                 .background(
                     Capsule(style: .continuous)
                         .fill(
@@ -542,21 +643,22 @@ struct ClipRow: View {
         .help(item.pinned ? "Unpin" : "Pin")
     }
 
-    private var copyButton: some View {
-        Button(action: { NSPasteboard.general.copyString(item.text) }) {
-            Image(systemName: "doc.on.clipboard")
-                .font(.system(size: 11, weight: .semibold))
-        }
-        .buttonStyle(.plain)
-        .help("Copy to clipboard (no auto-paste). Click the row to copy and paste.")
-    }
-
+    @ViewBuilder
     private var trailingActions: some View {
-        HStack(spacing: 6) {
+        if isMultiSelectMode {
+            // In select mode the row's trailing space conveys selection state instead
+            // of offering per-row actions (which would conflict with click-to-select).
+            Image(systemName: isMultiSelected ? "checkmark.circle.fill" : "circle")
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(isMultiSelected ? Color.accentColor : .secondary.opacity(0.6))
+                .symbolRenderingMode(.hierarchical)
+                .allowsHitTesting(false)
+        } else {
+            // Pin only — copy is redundant with the row tap (which auto-pastes) and the
+            // right-click "Copy" menu. Removed the doc-on-clipboard glyph for visual quiet.
             pinButton
-            copyButton
+                .opacity(isHovered ? 1 : 0.75)
         }
-        .opacity(isHovered ? 1 : 0.7)
     }
 
     private var rowBackground: some View {
@@ -622,6 +724,7 @@ struct ClipRow: View {
     }
 
     private var backgroundColor: Color {
+        if isMultiSelected { return Color.accentColor.opacity(0.22) }
         if isCopied { return Color.green.opacity(0.15) }
         if isSelected { return Color.accentColor.opacity(0.14) }
         if isHovered { return Color.gray.opacity(0.06) }
@@ -672,6 +775,21 @@ private struct FullTextPopover: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(Self.pad)
         }
+        .scrollContentBackground(.hidden)
+        // Glass / Liquid-Glass look — NSVisualEffectView with the system popover
+        // material composites the user's wallpaper through with a subtle vibrancy,
+        // matching macOS Tahoe's translucent surfaces.
+        .background(
+            VisualEffectView(material: .popover, blendingMode: .behindWindow, isEmphasized: false)
+                .ignoresSafeArea()
+        )
+        .overlay(
+            // Hairline edge so the glass surface has a defined boundary against the
+            // host window. Subtle — adapts to dark/light via white-with-opacity.
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color.white.opacity(0.10), lineWidth: 1)
+                .allowsHitTesting(false)
+        )
         .frame(
             minWidth: Self.minW, idealWidth: idealWidth, maxWidth: Self.maxW,
             minHeight: Self.minH, idealHeight: idealHeight, maxHeight: Self.maxH

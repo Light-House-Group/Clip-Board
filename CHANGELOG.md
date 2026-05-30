@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-05-29
+
+### Added
+
+- **Multi-select mode** — right-click any row → *Select* enters multi-select. Click anywhere on a row to toggle its selection (no leading checkboxes); a stronger accent tint plus a trailing checkmark indicates selected rows. The Clear button morphs into Cancel + **Delete N**. Esc exits the mode.
+- **Confirmation dialog on Clear** — system-style sheet asks before destroying history; Return triggers the destructive action, Esc cancels. ⌥-click variant uses a stronger warning ("Clear all items, including pinned?").
+- **Attribution footer** — "Clip-Board by Siddharth Sangwan" with a small clipboard glyph, centered at the bottom of the panel.
+- **Homebrew tap** — install via `brew install --cask light-house-group/tap/clip-board`.
+
+### Changed
+
+- **Header removed.** The redundant "Clipboard" label and icon are gone; top padding adjusted (20 pt) to keep the search bar off the rounded edge.
+- **Per-row trailing actions simplified.** Removed the per-row copy glyph (redundant with row tap which auto-pastes and with right-click → Copy). Pin glyph upsized from 11 pt to 14 pt for stronger affordance.
+- **Glass preview popover.** The full-text hover popover now uses `NSVisualEffectView` with the system popover material for a Liquid-Glass-style translucent surface that adapts to the macOS Tahoe aesthetic.
+- **Sharper Escape priority** in the panel: preview → exit-select → clear-search → close-panel.
+
+[1.1.0]: https://github.com/Light-House-Group/Clip-Board/releases/tag/v1.1.0
+
 ## [1.0.0] — 2026-05-29
 
 First public release.
