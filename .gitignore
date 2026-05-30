@@ -12,6 +12,7 @@ xcuserdata/
 build/
 Build/
 DerivedData/
+*.app
 *.app/
 *.app.dSYM/
 *.dSYM/
