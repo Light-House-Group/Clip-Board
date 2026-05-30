@@ -2,6 +2,26 @@
 
 All notable changes to this project are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] — 2026-05-29
+
+### Added
+
+- **Image & screenshot history.** Any image placed on the clipboard (screenshots copied with `⌃` modifiers, images copied from browsers, etc.) is captured into history. Images are stored as **individual AES-GCM-encrypted files** (`ClipboardManager/images/<id>.imgenc`) — never embedded in the history JSON — so text-copy saves stay cheap and the encrypted-at-rest guarantee extends to images. Rows show the image shrunk to the panel width (aspect preserved, height capped); hovering for 1 s opens a full-resolution, scrollable preview. Clicking an image row copies it back and auto-pastes it.
+- **Source-app attribution.** Each entry records the app it was copied from; the row shows that app's icon and name next to the timestamp.
+
+### Changed
+
+- **Full value shown whenever a row is truncated.** Replaced the character-count heuristic with real, measured truncation detection — any text row that's visually clipped (`…`) is now hoverable for the full value, not just long ones.
+- **Fixed the trailing gap in the text preview popover.** It now sizes to the measured content height instead of an over-estimate.
+
+### Security / hygiene
+
+- History schema bumped to v2 (backward compatible: v1 files load unchanged; new fields are optional).
+- Orphaned image files (from a crash or external history wipe) are pruned on launch.
+- Self-originated pasteboard writes (auto-paste/copy) are now suppressed from the watcher, preventing self-echo and preserving original source-app attribution.
+
+[1.2.0]: https://github.com/Light-House-Group/Clip-Board/releases/tag/v1.2.0
+
 ## [1.1.0] — 2026-05-29
 
 ### Added

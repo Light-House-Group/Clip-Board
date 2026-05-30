@@ -5,6 +5,8 @@ import CryptoKit
 import Security
 import ServiceManagement
 import Carbon
+import ImageIO
+import UniformTypeIdentifiers
 import os
 
 // MARK: - Logging
@@ -181,6 +183,154 @@ final class KeyManager {
     }
 }
 
+// MARK: - App Support Paths
+
+/// Centralized on-disk locations, each created with tight permissions on first access.
+enum AppPaths {
+    /// `~/Library/Application Support/ClipboardManager` (0700).
+    static var base: URL {
+        let fm = FileManager.default
+        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let folder = appSupport.appendingPathComponent("ClipboardManager", isDirectory: true)
+        ensureDirectory(folder)
+        return folder
+    }
+
+    /// `…/ClipboardManager/images` (0700) — encrypted per-image files.
+    static var imagesFolder: URL {
+        let folder = base.appendingPathComponent("images", isDirectory: true)
+        ensureDirectory(folder)
+        return folder
+    }
+
+    private static func ensureDirectory(_ url: URL) {
+        let fm = FileManager.default
+        guard !fm.fileExists(atPath: url.path) else { return }
+        do {
+            try fm.createDirectory(at: url, withIntermediateDirectories: true,
+                                   attributes: [.posixPermissions: 0o700])
+        } catch {
+            Log.persistence.error("Failed to create \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+        }
+    }
+}
+
+// MARK: - Image Store
+
+/// Stores clipboard images as individual AES-GCM-encrypted files, one per item, under
+/// `ClipboardManager/images`. Per-file (rather than embedding bytes in the single history
+/// JSON) keeps text-copy saves cheap and avoids rewriting every image on each change.
+///
+/// Thumbnails are produced via ImageIO (no full decode) and cached in memory for smooth
+/// scrolling; full images are decoded on demand for the hover preview and for pasting.
+final class ImageStore {
+    static let shared = ImageStore()
+    private init() {}
+
+    private let ioQueue = DispatchQueue(label: "ImageStore.IO", qos: .utility)
+    private let thumbnailCache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        c.countLimit = 120
+        return c
+    }()
+
+    /// PNG bytes for images whose encrypted disk write hasn't landed yet, so a freshly
+    /// captured image renders immediately if the panel is already open. Lock-guarded
+    /// because reads happen off-main (thumbnail decode) while writes happen on main.
+    private let pendingLock = NSLock()
+    private var pendingPNG: [String: Data] = [:]
+
+    private func url(for fileName: String) -> URL {
+        AppPaths.imagesFolder.appendingPathComponent(fileName)
+    }
+
+    func sha256Hex(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Encrypts and writes PNG bytes asynchronously (file mode 0600). Seeds the in-memory
+    /// caches synchronously so the new item is renderable before the write completes.
+    func save(png: Data, fileName: String) {
+        pendingLock.lock(); pendingPNG[fileName] = png; pendingLock.unlock()
+        if let thumb = Self.makeThumbnail(from: png, maxPixelSize: 800) {
+            thumbnailCache.setObject(thumb, forKey: cacheKey(fileName, 800))
+        }
+
+        let url = url(for: fileName)
+        ioQueue.async {
+            do {
+                let encrypted = try KeyManager.shared.encrypt(data: png)
+                try encrypted.write(to: url, options: .atomic)
+                try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            } catch {
+                Log.persistence.error("Image save failed: \(error.localizedDescription, privacy: .public)")
+            }
+            self.pendingLock.lock(); self.pendingPNG[fileName] = nil; self.pendingLock.unlock()
+        }
+    }
+
+    func delete(fileName: String) {
+        pendingLock.lock(); pendingPNG[fileName] = nil; pendingLock.unlock()
+        thumbnailCache.removeObject(forKey: cacheKey(fileName, 800))
+        let url = url(for: fileName)
+        ioQueue.async {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    /// Decrypts and returns the raw PNG bytes (used for pasting and full-image decode).
+    func loadPNG(fileName: String) -> Data? {
+        pendingLock.lock(); let pending = pendingPNG[fileName]; pendingLock.unlock()
+        if let pending { return pending }
+        let url = url(for: fileName)
+        guard let blob = try? Data(contentsOf: url) else { return nil }
+        return try? KeyManager.shared.decrypt(blob)
+    }
+
+    /// Full-resolution image for the hover preview.
+    func loadFullImage(fileName: String) -> NSImage? {
+        guard let png = loadPNG(fileName: fileName) else { return nil }
+        return NSImage(data: png)
+    }
+
+    /// Downscaled thumbnail (cached) for list rows. `maxPixelSize` is the longest edge.
+    func loadThumbnail(fileName: String, maxPixelSize: Int) -> NSImage? {
+        let key = cacheKey(fileName, maxPixelSize)
+        if let cached = thumbnailCache.object(forKey: key) { return cached }
+        guard let png = loadPNG(fileName: fileName),
+              let image = Self.makeThumbnail(from: png, maxPixelSize: maxPixelSize) else { return nil }
+        thumbnailCache.setObject(image, forKey: key)
+        return image
+    }
+
+    /// Efficient downscale via ImageIO (no full bitmap decode).
+    private static func makeThumbnail(from png: Data, maxPixelSize: Int) -> NSImage? {
+        guard let src = CGImageSourceCreateWithData(png as CFData, nil) else { return nil }
+        let opts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, opts as CFDictionary) else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+    }
+
+    /// Removes encrypted image files no longer referenced by any history item.
+    func pruneOrphans(referenced: Set<String>) {
+        ioQueue.async {
+            let fm = FileManager.default
+            guard let names = try? fm.contentsOfDirectory(atPath: AppPaths.imagesFolder.path) else { return }
+            for name in names where !referenced.contains(name) {
+                try? fm.removeItem(at: self.url(for: name))
+            }
+        }
+    }
+
+    private func cacheKey(_ fileName: String, _ size: Int) -> NSString {
+        "\(fileName)@\(size)" as NSString
+    }
+}
+
 // MARK: - Persistence
 
 /// `nonisolated` so its Codable conformance is callable from the persistence IO queue
@@ -195,7 +345,7 @@ final class PersistenceManager {
     private init() {}
 
     private let fileName = "history.json.enc"
-    private let currentSchemaVersion = 1
+    private let currentSchemaVersion = 2
 
     private static let encoder: JSONEncoder = {
         let e = JSONEncoder()
@@ -212,19 +362,7 @@ final class PersistenceManager {
     private let ioQueue = DispatchQueue(label: "PersistenceManager.IO", qos: .utility)
 
     private var fileURL: URL {
-        let fm = FileManager.default
-        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let folder = appSupport.appendingPathComponent("ClipboardManager", isDirectory: true)
-        if !fm.fileExists(atPath: folder.path) {
-            do {
-                try fm.createDirectory(at: folder, withIntermediateDirectories: true, attributes: [
-                    .posixPermissions: 0o700
-                ])
-            } catch {
-                Log.persistence.error("Failed to create app support folder: \(error.localizedDescription, privacy: .public)")
-            }
-        }
-        return folder.appendingPathComponent(fileName)
+        AppPaths.base.appendingPathComponent(fileName)
     }
 
     /// Caller must invoke on the main thread (items is snapshotted before async I/O).
@@ -307,9 +445,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 4. Track frontmost app for auto-paste target.
         AutoPaster.startTracking()
 
-        // 5. Start clipboard watcher.
-        ClipboardWatcher.shared.start { [weak self] text in
-            self?.itemsVM?.addItem(text)
+        // 5. Start clipboard watcher (text + images, with source-app attribution).
+        ClipboardWatcher.shared.start { [weak self] captured in
+            guard let vm = self?.itemsVM else { return }
+            switch captured {
+            case let .text(text, bundleID, appName):
+                vm.addText(text, sourceBundleID: bundleID, sourceAppName: appName)
+            case let .image(png, width, height, bundleID, appName):
+                vm.addImage(png: png, width: width, height: height,
+                            sourceBundleID: bundleID, sourceAppName: appName)
+            }
         }
 
         // 6. Register hotkey from preferences (no UI interaction needed).

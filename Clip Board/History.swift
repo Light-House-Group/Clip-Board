@@ -8,14 +8,43 @@ import os
 
 // MARK: - Data Model
 
+/// Kind of a stored clipboard entry. Optional on `ClipItem` for backward compatibility
+/// with v1 files that predate images — a missing value decodes to `nil` → treated as text.
+nonisolated enum ClipKind: String, Codable {
+    case text
+    case image
+}
+
 /// `nonisolated` so its Codable conformance is callable from the persistence IO queue.
 /// Without it, the project's `-default-isolation=MainActor` flag would bind the
 /// conformance to the main actor and emit a Swift 6 forward-compat warning.
+///
+/// All fields added after v1.0 are optional so older encrypted histories decode cleanly
+/// (synthesized `Decodable` maps a missing key for an `Optional` property to `nil`).
 nonisolated struct ClipItem: Identifiable, Codable, Equatable {
     let id: UUID
+    /// For text items: the content. For image items: a human label (e.g. "Image 1920×1080").
     let text: String
     var date: Date
     var pinned: Bool = false
+
+    // Added in 1.2 —
+    var kind: ClipKind? = nil
+    var imageFileName: String? = nil   // file under ImageStore (encrypted PNG)
+    var imageWidth: Int? = nil
+    var imageHeight: Int? = nil
+    var imageHash: String? = nil       // SHA-256 hex of PNG bytes, for image dedupe
+    var sourceBundleID: String? = nil  // bundle id of the app the copy came from
+    var sourceAppName: String? = nil   // localized name of that app
+
+    var resolvedKind: ClipKind { kind ?? .text }
+    var isImage: Bool { resolvedKind == .image }
+}
+
+/// What the clipboard watcher captured on a single pasteboard change.
+nonisolated enum CapturedItem {
+    case text(String, sourceBundleID: String?, sourceAppName: String?)
+    case image(png: Data, width: Int, height: Int, sourceBundleID: String?, sourceAppName: String?)
 }
 
 // MARK: - ViewModel
@@ -23,16 +52,21 @@ nonisolated struct ClipItem: Identifiable, Codable, Equatable {
 final class ItemsViewModel: ObservableObject {
     @Published private(set) var items: [ClipItem] = []
     private let limit = 100
-    /// Per-item character cap. Beyond this, the stored text is truncated with a marker.
-    /// Prevents a single very large copy (e.g., a multi-megabyte CSV) from bloating the
-    /// encrypted history file and slowing every subsequent save.
+    /// Per-item character cap for TEXT items. Beyond this the stored text is truncated with
+    /// a marker so a single multi-megabyte copy can't bloat the encrypted history file.
     private static let maxItemChars = 100_000
     private static let truncationMarker = "\n\n[…truncated by Clip-Board]"
+    /// Hard ceiling on a single stored image (bytes of PNG). Larger images are dropped.
+    private static let maxImageBytes = 25_000_000
+
     private let saveSubject = PassthroughSubject<Void, Never>()
     private var cancellables: Set<AnyCancellable> = []
 
     init() {
         items = PersistenceManager.shared.load()
+
+        // Delete any orphaned image files left by a crash or external history wipe.
+        ImageStore.shared.pruneOrphans(referenced: Set(items.compactMap { $0.imageFileName }))
 
         // Debounce on main so the items read happens on the same queue that mutates it.
         // PersistenceManager.save then dispatches encode/encrypt/write to its own ioQueue.
@@ -47,9 +81,10 @@ final class ItemsViewModel: ObservableObject {
 
     private func scheduleSave() { saveSubject.send(()) }
 
-    /// Adds an item; preserves internal whitespace/newlines, only trims leading/trailing,
-    /// and truncates beyond `maxItemChars`. Dedupes by exact equality of the stored text.
-    func addItem(_ text: String) {
+    /// Adds a text item; preserves internal whitespace/newlines, only trims leading/trailing,
+    /// and truncates beyond `maxItemChars`. Dedupes by exact equality of the stored text
+    /// (an existing match moves to the top and refreshes its date + source app).
+    func addText(_ text: String, sourceBundleID: String? = nil, sourceAppName: String? = nil) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
 
@@ -60,15 +95,57 @@ final class ItemsViewModel: ObservableObject {
             stored = trimmed
         }
 
-        if let existingIndex = items.firstIndex(where: { $0.text == stored }) {
+        if let existingIndex = items.firstIndex(where: { !$0.isImage && $0.text == stored }) {
             var existing = items.remove(at: existingIndex)
             existing.date = Date()
+            existing.sourceBundleID = sourceBundleID ?? existing.sourceBundleID
+            existing.sourceAppName = sourceAppName ?? existing.sourceAppName
             items.insert(existing, at: 0)
             scheduleSave()
             return
         }
 
-        let newItem = ClipItem(id: UUID(), text: stored, date: Date())
+        let newItem = ClipItem(
+            id: UUID(), text: stored, date: Date(), pinned: false,
+            kind: .text,
+            sourceBundleID: sourceBundleID, sourceAppName: sourceAppName
+        )
+        items.insert(newItem, at: 0)
+        trimIfNeeded()
+        scheduleSave()
+    }
+
+    /// Adds an image item. Encrypts the PNG to its own file, dedupes by content hash
+    /// (an identical image already present moves to the top).
+    func addImage(png: Data, width: Int, height: Int,
+                  sourceBundleID: String? = nil, sourceAppName: String? = nil) {
+        guard png.count <= Self.maxImageBytes else {
+            Log.clipboard.info("Skipped image: \(png.count) bytes exceeds cap.")
+            return
+        }
+        let hash = ImageStore.shared.sha256Hex(png)
+
+        if let existingIndex = items.firstIndex(where: { $0.imageHash == hash }) {
+            var existing = items.remove(at: existingIndex)
+            existing.date = Date()
+            existing.sourceBundleID = sourceBundleID ?? existing.sourceBundleID
+            existing.sourceAppName = sourceAppName ?? existing.sourceAppName
+            items.insert(existing, at: 0)
+            scheduleSave()
+            return
+        }
+
+        let id = UUID()
+        let fileName = "\(id.uuidString).imgenc"
+        ImageStore.shared.save(png: png, fileName: fileName)
+
+        let label = "Image \(width)×\(height)"
+        let newItem = ClipItem(
+            id: id, text: label, date: Date(), pinned: false,
+            kind: .image,
+            imageFileName: fileName, imageWidth: width, imageHeight: height, imageHash: hash,
+            sourceBundleID: sourceBundleID, sourceAppName: sourceAppName
+        )
         items.insert(newItem, at: 0)
         trimIfNeeded()
         scheduleSave()
@@ -82,16 +159,19 @@ final class ItemsViewModel: ObservableObject {
     }
 
     func deleteItem(_ id: UUID) {
-        if let idx = items.firstIndex(where: { $0.id == id }) {
-            items.remove(at: idx)
-            scheduleSave()
-        }
+        guard let idx = items.firstIndex(where: { $0.id == id }) else { return }
+        deleteImageFiles(for: [items[idx]])
+        items.remove(at: idx)
+        scheduleSave()
     }
 
     func clearHistory(removePinned: Bool = false) {
         if removePinned {
+            deleteImageFiles(for: items)
             items.removeAll()
         } else {
+            let removed = items.filter { !$0.pinned }
+            deleteImageFiles(for: removed)
             items.removeAll(where: { !$0.pinned })
         }
         scheduleSave()
@@ -100,9 +180,16 @@ final class ItemsViewModel: ObservableObject {
     private func trimIfNeeded() {
         let nonPinned = items.filter { !$0.pinned }
         if nonPinned.count > limit {
-            let toRemove = nonPinned.dropFirst(limit)
+            let toRemove = Array(nonPinned.dropFirst(limit))
             let idsToRemove = Set(toRemove.map { $0.id })
+            deleteImageFiles(for: toRemove)
             items.removeAll { idsToRemove.contains($0.id) }
+        }
+    }
+
+    private func deleteImageFiles(for items: [ClipItem]) {
+        for item in items where item.isImage {
+            if let fn = item.imageFileName { ImageStore.shared.delete(fileName: fn) }
         }
     }
 }
@@ -120,15 +207,23 @@ final class ClipboardWatcher {
         NSPasteboard.PasteboardType("org.nspasteboard.AutoGeneratedType")
     ]
 
+    /// When we write to the pasteboard ourselves (auto-paste, copy actions), we stamp the
+    /// resulting changeCount here so the watcher ignores it — preventing self-echo and
+    /// preserving the original item's source-app attribution.
+    private static var suppressedChangeCount: Int = -1
+    static func suppressNextChange() {
+        suppressedChangeCount = NSPasteboard.general.changeCount
+    }
+
     private var timer: Timer?
     private var lastChangeCount: Int = NSPasteboard.general.changeCount
     private var lastStoredText: String?
-    private var onNewItem: ((String) -> Void)?
+    private var onNew: ((CapturedItem) -> Void)?
 
     deinit { timer?.invalidate() }
 
-    func start(onNewItem: @escaping (String) -> Void) {
-        self.onNewItem = onNewItem
+    func start(onNew: @escaping (CapturedItem) -> Void) {
+        self.onNew = onNew
         stop()
         lastChangeCount = -1
 
@@ -154,10 +249,18 @@ final class ClipboardWatcher {
         guard change != lastChangeCount else { return }
         lastChangeCount = change
 
+        // Ignore changes we caused ourselves (auto-paste / copy actions).
+        if change == Self.suppressedChangeCount { return }
+
         // Skip items marked transient/concealed/auto-generated by other apps.
         let types = pb.types ?? []
         if types.contains(where: { Self.transientTypes.contains($0) }) { return }
 
+        // Source app = whatever is frontmost at capture time (we're a background agent,
+        // so the foreground app is the one the user copied from).
+        let (srcBundle, srcName) = Self.currentSourceApp()
+
+        // Prefer text; fall back to image (screenshots/copied images have no string).
         var text: String?
         if let s = pb.string(forType: .string) {
             text = s
@@ -166,13 +269,41 @@ final class ClipboardWatcher {
             text = first as String
         }
 
-        guard let raw = text else { return }
-        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        guard trimmed != lastStoredText else { return }
-        lastStoredText = trimmed
+        if let raw = text {
+            let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else { return }
+            guard trimmed != lastStoredText else { return }
+            lastStoredText = trimmed
+            onNew?(.text(raw, sourceBundleID: srcBundle, sourceAppName: srcName))
+            return
+        }
 
-        onNewItem?(raw)
+        if let (png, w, h) = Self.imageCapture(pb) {
+            lastStoredText = nil
+            onNew?(.image(png: png, width: w, height: h, sourceBundleID: srcBundle, sourceAppName: srcName))
+        }
+    }
+
+    /// The frontmost non-self application, as (bundleID, localizedName).
+    private static func currentSourceApp() -> (String?, String?) {
+        guard let app = NSWorkspace.shared.frontmostApplication,
+              app.bundleIdentifier != Bundle.main.bundleIdentifier else {
+            return (nil, nil)
+        }
+        return (app.bundleIdentifier, app.localizedName)
+    }
+
+    /// Extracts PNG bytes + pixel dimensions from the pasteboard, normalizing TIFF → PNG.
+    private static func imageCapture(_ pb: NSPasteboard) -> (Data, Int, Int)? {
+        if let png = pb.data(forType: .png), let rep = NSBitmapImageRep(data: png) {
+            return (png, rep.pixelsWide, rep.pixelsHigh)
+        }
+        if let tiff = pb.data(forType: .tiff),
+           let rep = NSBitmapImageRep(data: tiff),
+           let png = rep.representation(using: .png, properties: [:]) {
+            return (png, rep.pixelsWide, rep.pixelsHigh)
+        }
+        return nil
     }
 }
 
@@ -280,7 +411,7 @@ final class HotkeyManager {
 /// by synthesizing a Cmd-V keystroke after activating that app.
 ///
 /// Requires Accessibility permission; prompts on first paste attempt. If the
-/// user denies, the clipboard still contains the text and they can paste manually.
+/// user denies, the content still lands on the clipboard for a manual paste.
 final class AutoPaster {
     static let shared = AutoPaster()
     private init() {}
@@ -317,22 +448,27 @@ final class AutoPaster {
         }
     }
 
-    /// Copies `text` to the clipboard and synthesizes Cmd-V into the previously active app.
-    /// Polls for the target app to actually become frontmost before posting the keystroke
-    /// so the paste lands in the right place regardless of activation timing.
+    /// Copies `text` to the clipboard, then pastes into the previously active app.
     static func pasteIntoPreviousApp(text: String) {
         NSPasteboard.general.copyString(text)
+        deliverPaste()
+    }
 
+    /// Copies image `png` to the clipboard, then pastes into the previously active app.
+    static func pasteIntoPreviousApp(imageData png: Data) {
+        NSPasteboard.general.copyImageData(png)
+        deliverPaste()
+    }
+
+    private static func deliverPaste() {
         guard let app = lastActiveApp else {
-            Log.autopaste.info("No previous app captured; text on clipboard only.")
+            Log.autopaste.info("No previous app captured; content on clipboard only.")
             return
         }
-
         guard ensureAccessibilityTrust() else {
-            Log.autopaste.info("Accessibility not trusted; text on clipboard only.")
+            Log.autopaste.info("Accessibility not trusted; content on clipboard only.")
             return
         }
-
         Log.autopaste.info("Activating target: \(app.localizedName ?? "?", privacy: .public) (pid=\(app.processIdentifier))")
         app.activate(options: [])
 
@@ -378,6 +514,27 @@ final class AutoPaster {
     }
 }
 
+// MARK: - App Icon Provider
+
+/// Resolves and caches app icons by bundle identifier, for the per-item source-app chip.
+/// Main-thread only (NSWorkspace); cheap and cached, so safe to call during view body.
+enum AppIconProvider {
+    private static var cache: [String: NSImage] = [:]
+
+    static func icon(forBundleID id: String?) -> NSImage? {
+        guard let id, !id.isEmpty else { return nil }
+        if let cached = cache[id] { return cached }
+        var icon: NSImage?
+        if let running = NSRunningApplication.runningApplications(withBundleIdentifier: id).first {
+            icon = running.icon
+        } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) {
+            icon = NSWorkspace.shared.icon(forFile: url.path)
+        }
+        if let icon { cache[id] = icon }
+        return icon
+    }
+}
+
 // MARK: - Utilities
 
 extension String {
@@ -394,8 +551,17 @@ extension String {
 }
 
 extension NSPasteboard {
+    /// Writes a string and suppresses the resulting watcher echo.
     func copyString(_ string: String) {
         clearContents()
         setString(string, forType: .string)
+        ClipboardWatcher.suppressNextChange()
+    }
+
+    /// Writes PNG image data and suppresses the resulting watcher echo.
+    func copyImageData(_ png: Data) {
+        clearContents()
+        setData(png, forType: .png)
+        ClipboardWatcher.suppressNextChange()
     }
 }

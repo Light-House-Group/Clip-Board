@@ -298,15 +298,26 @@ struct ContentView: View {
         guard let item = itemsVM.items.first(where: { $0.id == id }) else { return }
         switch action {
         case .copy:
-            let text = item.text
             selectedID = id
             copiedTimestamps[id] = Date()
             scheduleCopiedCleanup(for: id)
             HistoryWindowController.shared.close()
-            // Defer slightly so the panel finishes ordering out before we activate the
-            // previous app and synthesize Cmd-V into it.
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                AutoPaster.pasteIntoPreviousApp(text: text)
+
+            if item.isImage, let fileName = item.imageFileName {
+                // Decrypt off-main, then paste the image into the previous app.
+                DispatchQueue.global(qos: .userInitiated).async {
+                    let png = ImageStore.shared.loadPNG(fileName: fileName)
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        if let png { AutoPaster.pasteIntoPreviousApp(imageData: png) }
+                    }
+                }
+            } else {
+                let text = item.text
+                // Defer slightly so the panel finishes ordering out before we activate the
+                // previous app and synthesize Cmd-V into it.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    AutoPaster.pasteIntoPreviousApp(text: text)
+                }
             }
         }
     }
@@ -541,13 +552,17 @@ struct ClipRow: View {
     @EnvironmentObject var itemsVM: ItemsViewModel
     @State private var isHovered: Bool = false
     @State private var hoverWorkItem: DispatchWorkItem?
+    /// Set by the row's text measurement: true when `lineLimit(2)` actually clips the content.
+    @State private var isTextTruncated: Bool = false
 
-    /// Heuristic for "would this row get visually truncated at lineLimit(2)?"
-    /// - Any newline: even short lines compose to >2 visual lines if there are 3+.
-    /// - Long single-line text wraps past two lines.
-    private var hasLongContent: Bool {
-        item.text.contains("\n") || item.text.count > 100
+    /// Image rows are always previewable (full-size on hover). Text rows are previewable
+    /// only when the row is actually visually truncated — measured, not guessed.
+    private var previewEligible: Bool {
+        item.isImage || isTextTruncated
     }
+
+    /// Maximum on-screen height for an image thumbnail inside a row.
+    private static let imageRowMaxHeight: CGFloat = 200
 
     /// Bound to the popover; reads/writes the parent's shared `previewItemID`
     /// so only one preview is visible across the whole list at a time.
@@ -570,15 +585,24 @@ struct ClipRow: View {
 
     private var timeString: String { Self.formatter.string(from: item.date) }
 
-    private var titleText: some View {
-        // No textSelection — it would swallow row clicks and expand the row in selection mode.
-        Text(item.text)
-            .lineLimit(2)
-            .truncationMode(.tail)
-            .font(.system(size: 13))
-            .foregroundColor(.primary)
-            .frame(maxWidth: .infinity, alignment: .leading)
+    /// Row content: either a measured 2-line text block or an image thumbnail
+    /// shrunk to the row width (aspect preserved, height capped).
+    @ViewBuilder
+    private var rowContent: some View {
+        if item.isImage, let fileName = item.imageFileName {
+            ClipThumbnail(
+                fileName: fileName,
+                pixelWidth: item.imageWidth ?? 1,
+                pixelHeight: item.imageHeight ?? 1,
+                maxHeight: Self.imageRowMaxHeight
+            )
             .allowsHitTesting(false)
+        } else {
+            // No textSelection — it would swallow row clicks. Truncation is measured so
+            // the hover preview only offers itself when content is actually clipped.
+            TruncatingText(text: item.text, isTruncated: $isTextTruncated)
+                .allowsHitTesting(false)
+        }
     }
 
     private var pinBadge: some View {
@@ -601,8 +625,24 @@ struct ClipRow: View {
     }
 
     private var metaRow: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 5) {
             pinBadge
+            // Source-app chip — icon + name, so it's clear where the copy came from.
+            if let icon = AppIconProvider.icon(forBundleID: item.sourceBundleID) {
+                Image(nsImage: icon)
+                    .resizable()
+                    .interpolation(.high)
+                    .frame(width: 13, height: 13)
+            }
+            if let name = item.sourceAppName, !name.isEmpty {
+                Text(name)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Text("·")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary.opacity(0.6))
+            }
             Text(timeString)
                 .font(.caption2.monospacedDigit())
                 .foregroundStyle(.secondary)
@@ -674,7 +714,7 @@ struct ClipRow: View {
     var body: some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 4) {
-                titleText
+                rowContent
                 metaRow
             }
 
@@ -695,10 +735,18 @@ struct ClipRow: View {
             scheduleOrCancelPreview(hovering: hover)
         }
         .popover(isPresented: showPreview, arrowEdge: .trailing) {
-            FullTextPopover(text: item.text)
+            if item.isImage, let fileName = item.imageFileName {
+                FullImagePopover(
+                    fileName: fileName,
+                    pixelWidth: item.imageWidth ?? 1,
+                    pixelHeight: item.imageHeight ?? 1
+                )
+            } else {
+                FullTextPopover(text: item.text)
+            }
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(Text("Clipboard item"))
+        .accessibilityLabel(Text(item.isImage ? "Clipboard image" : "Clipboard item"))
         .accessibilityValue(Text(item.text))
     }
 
@@ -714,7 +762,7 @@ struct ClipRow: View {
         if previewItemID != nil && previewItemID != item.id {
             previewItemID = nil
         }
-        guard hasLongContent else { return }
+        guard previewEligible else { return }
         let work = DispatchWorkItem {
             // Only open if this row is still hovered when the timer fires.
             if isHovered { previewItemID = item.id }
@@ -732,39 +780,209 @@ struct ClipRow: View {
     }
 }
 
+// MARK: - Preview preference keys
+
+/// Max-reducing CGFloat preference key, reused for content-size measurement.
+private struct MaxCGFloatKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+private struct VisibleHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+private struct FullHeightKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
+/// Shared glassy popover chrome (Liquid-Glass-style translucent surface + hairline edge).
+private struct GlassPopoverBackground: View {
+    var body: some View {
+        VisualEffectView(material: .popover, blendingMode: .behindWindow, isEmphasized: false)
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(Color.white.opacity(0.10), lineWidth: 1)
+                    .allowsHitTesting(false)
+            )
+            .ignoresSafeArea()
+    }
+}
+
+// MARK: - Truncating text (measures real truncation)
+
+/// Renders text clipped to two lines, and reports — via `isTruncated` — whether the
+/// content is *actually* visually clipped at the current width. Compares the rendered
+/// (2-line) height against the full unconstrained height laid out at the same width.
+private struct TruncatingText: View {
+    let text: String
+    @Binding var isTruncated: Bool
+    @State private var visibleH: CGFloat = 0
+    @State private var fullH: CGFloat = 0
+
+    var body: some View {
+        Text(text)
+            .lineLimit(2)
+            .truncationMode(.tail)
+            .font(.system(size: 13))
+            .foregroundColor(.primary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(GeometryReader { g in
+                Color.clear.preference(key: VisibleHeightKey.self, value: g.size.height)
+            })
+            .background(
+                // Hidden, unconstrained-height copy laid out at the same width.
+                Text(text)
+                    .font(.system(size: 13))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .hidden()
+                    .background(GeometryReader { g in
+                        Color.clear.preference(key: FullHeightKey.self, value: g.size.height)
+                    })
+            )
+            .onPreferenceChange(VisibleHeightKey.self) { v in visibleH = v; recompute() }
+            .onPreferenceChange(FullHeightKey.self) { f in fullH = f; recompute() }
+    }
+
+    private func recompute() {
+        let truncated = fullH > visibleH + 1
+        guard truncated != isTruncated else { return }
+        DispatchQueue.main.async { isTruncated = truncated }
+    }
+}
+
+// MARK: - Image thumbnail (row) & full image preview (popover)
+
+/// A decrypted image thumbnail shrunk to the row width with aspect preserved and a
+/// capped height. Reserves layout space from the known pixel dimensions before the
+/// (off-main) decrypt+decode completes, so rows don't jump as images load.
+private struct ClipThumbnail: View {
+    let fileName: String
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let maxHeight: CGFloat
+    @State private var image: NSImage?
+
+    private var aspect: CGFloat {
+        pixelWidth > 0 && pixelHeight > 0 ? CGFloat(pixelWidth) / CGFloat(pixelHeight) : 16.0 / 9.0
+    }
+
+    var body: some View {
+        Color.clear
+            .aspectRatio(aspect, contentMode: .fit)
+            .frame(maxWidth: .infinity, maxHeight: maxHeight)
+            .overlay {
+                if let image {
+                    Image(nsImage: image)
+                        .resizable()
+                        .interpolation(.medium)
+                        .scaledToFit()
+                } else {
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(Color.secondary.opacity(0.10))
+                        .overlay(Image(systemName: "photo").foregroundStyle(.secondary.opacity(0.5)))
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 6, style: .continuous)
+                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+            )
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .onAppear(perform: load)
+    }
+
+    private func load() {
+        guard image == nil else { return }
+        let fn = fileName
+        DispatchQueue.global(qos: .userInitiated).async {
+            let img = ImageStore.shared.loadThumbnail(fileName: fn, maxPixelSize: 800)
+            DispatchQueue.main.async { self.image = img }
+        }
+    }
+}
+
+/// Full-resolution image preview shown on hover, in a glassy popover sized to the image
+/// aspect (clamped). Scrollable when the image is capped.
+private struct FullImagePopover: View {
+    let fileName: String
+    let pixelWidth: Int
+    let pixelHeight: Int
+    @State private var image: NSImage?
+
+    private static let maxW: CGFloat = 760
+    private static let maxH: CGFloat = 560
+    private static let minW: CGFloat = 220
+    private static let minH: CGFloat = 140
+
+    private var aspect: CGFloat {
+        pixelWidth > 0 && pixelHeight > 0 ? CGFloat(pixelWidth) / CGFloat(pixelHeight) : 16.0 / 9.0
+    }
+
+    private var frameSize: CGSize {
+        var w = min(CGFloat(max(pixelWidth, 1)), Self.maxW)
+        var h = w / aspect
+        if h > Self.maxH { h = Self.maxH; w = h * aspect }
+        w = min(max(w, Self.minW), Self.maxW)
+        h = min(max(h, Self.minH), Self.maxH)
+        return CGSize(width: w, height: h)
+    }
+
+    var body: some View {
+        Group {
+            if let image {
+                ScrollView([.vertical, .horizontal]) {
+                    Image(nsImage: image)
+                        .resizable()
+                        .interpolation(.high)
+                        .scaledToFit()
+                        .frame(width: frameSize.width)
+                }
+                .scrollContentBackground(.hidden)
+            } else {
+                ProgressView().controlSize(.small)
+            }
+        }
+        .frame(width: frameSize.width, height: frameSize.height)
+        .background(GlassPopoverBackground())
+        .onAppear(perform: load)
+    }
+
+    private func load() {
+        guard image == nil else { return }
+        let fn = fileName
+        DispatchQueue.global(qos: .userInitiated).async {
+            let img = ImageStore.shared.loadFullImage(fileName: fn)
+            DispatchQueue.main.async { self.image = img }
+        }
+    }
+}
+
 // MARK: - Full-text Preview Popover
 
-/// Scrollable, text-selectable popover with smart auto-sizing for the clipboard item.
+/// Scrollable, text-selectable popover sized to the *measured* content height (no trailing
+/// gap). Width is a clamped estimate; height is the real content height capped at `maxH`.
 private struct FullTextPopover: View {
     let text: String
 
-    private static let minW: CGFloat = 360
-    private static let maxW: CGFloat = 600
-    private static let minH: CGFloat = 80
-    private static let maxH: CGFloat = 420
-    private static let charPx: CGFloat = 6.8   // approx char width at 13pt monospaced-ish
-    private static let lineH: CGFloat  = 18    // approx line height at 13pt
+    private static let minW: CGFloat = 320
+    private static let maxW: CGFloat = 620
+    private static let maxH: CGFloat = 460
+    private static let charPx: CGFloat = 6.9
     private static let pad: CGFloat = 14
 
-    private var idealWidth: CGFloat {
-        // Width that fits the widest line without forcing wrap, clamped.
-        let widest = text.components(separatedBy: "\n")
-            .map { $0.count }.max() ?? 0
+    @State private var measuredHeight: CGFloat = 0
+
+    private var width: CGFloat {
+        let widest = text.components(separatedBy: "\n").map { $0.count }.max() ?? 0
         let estimated = CGFloat(widest) * Self.charPx + Self.pad * 2
         return min(max(Self.minW, estimated), Self.maxW)
     }
 
-    private var idealHeight: CGFloat {
-        // Account for wrap: lines that exceed the ideal width split. Cheap estimate.
-        let widthForText = idealWidth - Self.pad * 2
-        let charsPerLine = max(1, Int(widthForText / Self.charPx))
-        var lines = 0
-        for raw in text.components(separatedBy: "\n") {
-            let wraps = max(1, Int(ceil(Double(raw.count) / Double(charsPerLine))))
-            lines += wraps
-        }
-        let estimated = CGFloat(lines) * Self.lineH + Self.pad * 2
-        return min(max(Self.minH, estimated), Self.maxH)
+    private var height: CGFloat {
+        let h = measuredHeight > 0 ? measuredHeight : 56
+        return min(h, Self.maxH)
     }
 
     var body: some View {
@@ -774,26 +992,14 @@ private struct FullTextPopover: View {
                 .font(.system(size: 13))
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(Self.pad)
+                .background(GeometryReader { g in
+                    Color.clear.preference(key: MaxCGFloatKey.self, value: g.size.height)
+                })
         }
         .scrollContentBackground(.hidden)
-        // Glass / Liquid-Glass look — NSVisualEffectView with the system popover
-        // material composites the user's wallpaper through with a subtle vibrancy,
-        // matching macOS Tahoe's translucent surfaces.
-        .background(
-            VisualEffectView(material: .popover, blendingMode: .behindWindow, isEmphasized: false)
-                .ignoresSafeArea()
-        )
-        .overlay(
-            // Hairline edge so the glass surface has a defined boundary against the
-            // host window. Subtle — adapts to dark/light via white-with-opacity.
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.white.opacity(0.10), lineWidth: 1)
-                .allowsHitTesting(false)
-        )
-        .frame(
-            minWidth: Self.minW, idealWidth: idealWidth, maxWidth: Self.maxW,
-            minHeight: Self.minH, idealHeight: idealHeight, maxHeight: Self.maxH
-        )
+        .onPreferenceChange(MaxCGFloatKey.self) { measuredHeight = $0 }
+        .background(GlassPopoverBackground())
+        .frame(width: width, height: height)
     }
 }
 
