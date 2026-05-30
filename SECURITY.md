@@ -53,4 +53,16 @@ Out of scope:
 - File mode `0600`, directory mode `0700`
 - Atomic writes (no partial-file exposure on crash)
 
+## Pasteboard exposure during auto-paste
+
+When you select an item, Clip-Board writes it to `NSPasteboard.general` (the system clipboard) and synthesizes ⌘V into the previously focused app. **That data lives in plaintext on the system pasteboard until you copy something else** — any concurrent process polling the clipboard (including other clipboard managers, password managers, or apps with paste-monitor entitlements) can see it during that window. This is intrinsic to "paste anything into any app" and is not specific to Clip-Board; if you need to scrub sensitive items proactively, copy a neutral value (e.g., a single space) afterwards.
+
+## Sandbox & entitlements
+
+The app is sandboxed (`com.apple.security.app-sandbox = true`) with **network entitlements explicitly disabled** (`com.apple.security.network.client = false`, `com.apple.security.network.server = false`). The entitlements file is checked into the repo at [`Clip Board/Clip Board.entitlements`](Clip%20Board/Clip%20Board.entitlements); reviewers can verify the signed binary against it with:
+
+```bash
+codesign -d --entitlements - "Clip Board.app"
+```
+
 If you have suggestions for hardening any of the above — particularly key rotation, in-memory protection, or schema integrity — open an issue (for design discussions) or follow the reporting process (for vulnerabilities).

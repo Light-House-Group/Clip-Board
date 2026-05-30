@@ -2,6 +2,37 @@
 
 All notable changes to this project are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.2] — 2026-05-30
+
+### Fixed
+
+- **Copy fidelity.** Leading/trailing whitespace on copied text is no longer stripped from the stored item. Previously, copying ` --flag` or ` :` would lose the leading space when pasted back from history; now items are stored byte-identical to what hit the clipboard. (Empty/whitespace-only copies are still skipped, and dedupe still applies — but on the raw value.)
+- **Multi-monitor panel placement.** The floating panel now opens on the screen the cursor is on, not the screen with the key window. Triggering the hotkey from a secondary display no longer clamps the panel onto your primary display.
+- **Thumbnail downscale moved off the main thread.** ImageIO downscale for newly captured screenshots now runs on the persistence I/O queue, eliminating a UI hitch when capturing large images.
+
+### Changed
+
+- **Launch-at-Login defaults to OFF.** Fresh installs no longer silently register themselves as a LaunchServices job; users opt in explicitly via the menu. Existing installs are unaffected (the stored preference takes precedence).
+- **App display name is now plain "Clip Board"** (dropped the `📎` emoji from `CFBundleDisplayName` — it rendered inconsistently in Spotlight/mini-bar contexts).
+- **Snapshot computation hoisted out of view body.** The filter/partition pass now runs only when its inputs (items, search text, visible limit) actually change, instead of on every hover/selection tick.
+
+### Security / hygiene
+
+- **Explicit `Clip Board.entitlements` checked in.** `com.apple.security.network.client` and `com.apple.security.network.server` are now explicitly `false` in a source-controlled file — reviewers can diff the signed binary's entitlements against the repo's source of truth with `codesign -d --entitlements - "Clip Board.app"`.
+- **Logger privacy tightened.** `error.localizedDescription` values are now logged with `privacy: .private` so disk paths or framework-derived text don't appear in system logs as `.public`.
+- **AppIconProvider cache capped** at 200 distinct bundle IDs (was unbounded).
+- **Sandboxed path corrected in docs.** The README and source comments now reflect that history actually lives under the app's sandbox container, not `~/Library/Application Support`.
+- **Pasteboard plaintext caveat** added to `SECURITY.md` (window between auto-paste and the next copy).
+
+### Removed
+
+- Dead `HotkeyManager.unregisterHotkey()` (never called).
+- Unused `import Combine` in `UIViews.swift`.
+- `ENABLE_TESTABILITY = YES` from Debug config (no test target consumes it).
+- Inconsistent `MACOSX_DEPLOYMENT_TARGET = 26.0` at the project level (target was 14.0; project now matches).
+
+[1.2.2]: https://github.com/Light-House-Group/Clip-Board/releases/tag/v1.2.2
+
 ## [1.2.1] — 2026-05-30
 
 ### Changed

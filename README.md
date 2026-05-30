@@ -136,7 +136,17 @@ The release binary is **ad-hoc signed**, so on first launch macOS Gatekeeper wil
 - No third-party Swift packages or CocoaPods dependencies
 - Only Apple-shipped frameworks: SwiftUI, AppKit, CryptoKit, Security, ServiceManagement, Carbon
 
-You can verify this with `otool -L "Clip Board.app/Contents/MacOS/Clip Board"` after downloading a release.
+Two verification commands you can run on any downloaded release:
+
+```bash
+# 1. Linked libraries — should contain only Apple system frameworks.
+otool -L "Clip Board.app/Contents/MacOS/Clip Board"
+
+# 2. Sandbox entitlements — should show network.client and network.server as <false/>.
+codesign -d --entitlements - "Clip Board.app"
+```
+
+The entitlements file is checked into the repo at [`Clip Board/Clip Board.entitlements`](Clip%20Board/Clip%20Board.entitlements) — the source of truth a reviewer can diff against the signed binary.
 
 ### Auto-paste and the Accessibility permission
 
@@ -172,7 +182,7 @@ The floating panel and the menu-bar window share the same SwiftUI root (`SharedH
 1. You copy text → macOS pasteboard updates → `changeCount` increments.
 2. `ClipboardWatcher` polls every 500 ms, detects the change, **skips transient/concealed types**.
 3. Trimmed text → `ItemsViewModel.addItem` → dedupe (move-to-top on exact match) or insert.
-4. After a 300 ms debounce, the items array is snapshotted on the main thread, then handed to the IO queue: **encode → AES-GCM encrypt → atomic write** to `~/Library/Application Support/ClipboardManager/history.json.enc` (file mode `0600`, directory mode `0700`).
+4. After a 300 ms debounce, the items array is snapshotted on the main thread, then handed to the IO queue: **encode → AES-GCM encrypt → atomic write** to the app's sandboxed Application Support directory (`~/Library/Containers/Siddharth.Sangwa.ClipBoard/Data/Library/Application Support/ClipboardManager/history.json.enc` — sandboxed apps can't reach the global `~/Library/Application Support`), file mode `0600`, directory mode `0700`.
 5. On launch: load file → decrypt → decode. If anything fails, **quarantine** to `history.broken-<timestamp>` and start fresh.
 
 History is wrapped as `{"version": 1, "items": [...]}` for forward compatibility. The legacy unversioned format is migrated transparently.

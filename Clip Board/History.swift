@@ -81,18 +81,20 @@ final class ItemsViewModel: ObservableObject {
 
     private func scheduleSave() { saveSubject.send(()) }
 
-    /// Adds a text item; preserves internal whitespace/newlines, only trims leading/trailing,
-    /// and truncates beyond `maxItemChars`. Dedupes by exact equality of the stored text
-    /// (an existing match moves to the top and refreshes its date + source app).
+    /// Adds a text item. Stores the copied text **verbatim** (whitespace preserved) so that
+    /// pasting from history reproduces what the user actually copied — important for things
+    /// like ` --flag`, ` :`, or anything where a leading/trailing space carries meaning.
+    /// Truncates beyond `maxItemChars`. Dedupes by exact-equal stored text (an existing match
+    /// moves to the top and refreshes its date + source app).
     func addText(_ text: String, sourceBundleID: String? = nil, sourceAppName: String? = nil) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
+        // Skip all-whitespace copies, but DO NOT mutate the stored value with trim.
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
         let stored: String
-        if trimmed.count > Self.maxItemChars {
-            stored = String(trimmed.prefix(Self.maxItemChars)) + Self.truncationMarker
+        if text.count > Self.maxItemChars {
+            stored = String(text.prefix(Self.maxItemChars)) + Self.truncationMarker
         } else {
-            stored = trimmed
+            stored = text
         }
 
         if let existingIndex = items.firstIndex(where: { !$0.isImage && $0.text == stored }) {
@@ -391,18 +393,6 @@ final class HotkeyManager {
         }
     }
 
-    func unregisterHotkey() {
-        if let ref = hotKeyRef {
-            let status = UnregisterEventHotKey(ref)
-            if status != noErr { Log.hotkey.error("Unregister hotkey failed: \(status)") }
-            hotKeyRef = nil
-        }
-        if let handlerRef = eventHandlerRef {
-            RemoveEventHandler(handlerRef)
-            eventHandlerRef = nil
-        }
-        handler = nil
-    }
 }
 
 // MARK: - Auto Paster
@@ -518,8 +508,12 @@ final class AutoPaster {
 
 /// Resolves and caches app icons by bundle identifier, for the per-item source-app chip.
 /// Main-thread only (NSWorkspace); cheap and cached, so safe to call during view body.
+/// Capped at `cacheLimit` distinct bundle IDs — well above any realistic distinct-app
+/// count for one user's clipboard history, but bounded so a long-lived session can't grow
+/// without limit.
 enum AppIconProvider {
     private static var cache: [String: NSImage] = [:]
+    private static let cacheLimit = 200
 
     static func icon(forBundleID id: String?) -> NSImage? {
         guard let id, !id.isEmpty else { return nil }
@@ -530,7 +524,10 @@ enum AppIconProvider {
         } else if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: id) {
             icon = NSWorkspace.shared.icon(forFile: url.path)
         }
-        if let icon { cache[id] = icon }
+        if let icon {
+            if cache.count >= cacheLimit { cache.removeAll(keepingCapacity: true) }
+            cache[id] = icon
+        }
         return icon
     }
 }

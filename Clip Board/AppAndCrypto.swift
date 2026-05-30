@@ -57,14 +57,19 @@ final class Preferences {
     }
 
     var launchAtLogin: Bool {
-        get { defaults.object(forKey: Keys.launchAtLogin) as? Bool ?? true }
+        get { defaults.object(forKey: Keys.launchAtLogin) as? Bool ?? false }
         set {
             defaults.set(newValue, forKey: Keys.launchAtLogin)
             applyLaunchAtLogin(newValue)
         }
     }
 
+    /// Reconcile the SMAppService registration with the stored preference, but only when
+    /// the user has *explicitly* set a value. A fresh install must not silently register
+    /// itself with LaunchServices — that's exactly the kind of invisible-install behavior
+    /// the rest of this app is built to avoid.
     func syncLaunchAtLoginOnStartup() {
+        guard defaults.object(forKey: Keys.launchAtLogin) != nil else { return }
         applyLaunchAtLogin(launchAtLogin)
     }
 
@@ -76,7 +81,7 @@ final class Preferences {
             if on { try SMAppService.mainApp.register() }
             else  { try SMAppService.mainApp.unregister() }
         } catch {
-            Log.app.error("Launch-at-login toggle failed: \(error.localizedDescription, privacy: .public)")
+            Log.app.error("Launch-at-login toggle failed: \(error.localizedDescription, privacy: .private)")
         }
     }
 }
@@ -185,23 +190,29 @@ final class KeyManager {
 
 // MARK: - App Support Paths
 
-/// Centralized on-disk locations, each created with tight permissions on first access.
+/// Centralized on-disk locations, each created with tight permissions once at first use.
+///
+/// Under the app sandbox, `applicationSupportDirectory` resolves to the container path
+/// (`~/Library/Containers/<bundle-id>/Data/Library/Application Support/ClipboardManager`),
+/// not the global `~/Library/Application Support`. Either way, it's per-user and
+/// inaccessible to other apps without the user explicitly granting access.
 enum AppPaths {
-    /// `~/Library/Application Support/ClipboardManager` (0700).
-    static var base: URL {
+    /// `…/Application Support/ClipboardManager` (0700). Cached — created once.
+    static let base: URL = {
         let fm = FileManager.default
-        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+            ?? fm.temporaryDirectory
         let folder = appSupport.appendingPathComponent("ClipboardManager", isDirectory: true)
         ensureDirectory(folder)
         return folder
-    }
+    }()
 
-    /// `…/ClipboardManager/images` (0700) — encrypted per-image files.
-    static var imagesFolder: URL {
+    /// `…/ClipboardManager/images` (0700) — encrypted per-image files. Cached.
+    static let imagesFolder: URL = {
         let folder = base.appendingPathComponent("images", isDirectory: true)
         ensureDirectory(folder)
         return folder
-    }
+    }()
 
     private static func ensureDirectory(_ url: URL) {
         let fm = FileManager.default
@@ -210,7 +221,7 @@ enum AppPaths {
             try fm.createDirectory(at: url, withIntermediateDirectories: true,
                                    attributes: [.posixPermissions: 0o700])
         } catch {
-            Log.persistence.error("Failed to create \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            Log.persistence.error("Failed to create \(url.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .private)")
         }
     }
 }
@@ -249,21 +260,25 @@ final class ImageStore {
     }
 
     /// Encrypts and writes PNG bytes asynchronously (file mode 0600). Seeds the in-memory
-    /// caches synchronously so the new item is renderable before the write completes.
+    /// `pendingPNG` synchronously so the new item is already renderable (decode via
+    /// `loadPNG`) before the write lands; the ImageIO thumbnail downscale runs on `ioQueue`
+    /// (large screenshots are too heavy to decode on main).
     func save(png: Data, fileName: String) {
         pendingLock.lock(); pendingPNG[fileName] = png; pendingLock.unlock()
-        if let thumb = Self.makeThumbnail(from: png, maxPixelSize: 800) {
-            thumbnailCache.setObject(thumb, forKey: cacheKey(fileName, 800))
-        }
 
         let url = url(for: fileName)
+        let thumbKey = cacheKey(fileName, 800)
         ioQueue.async {
+            // NSCache is thread-safe; populate the thumbnail off-main.
+            if let thumb = Self.makeThumbnail(from: png, maxPixelSize: 800) {
+                self.thumbnailCache.setObject(thumb, forKey: thumbKey)
+            }
             do {
                 let encrypted = try KeyManager.shared.encrypt(data: png)
                 try encrypted.write(to: url, options: .atomic)
                 try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
             } catch {
-                Log.persistence.error("Image save failed: \(error.localizedDescription, privacy: .public)")
+                Log.persistence.error("Image save failed: \(error.localizedDescription, privacy: .private)")
             }
             self.pendingLock.lock(); self.pendingPNG[fileName] = nil; self.pendingLock.unlock()
         }
@@ -378,7 +393,7 @@ final class PersistenceManager {
                 try encrypted.write(to: url, options: .atomic)
                 try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
             } catch {
-                Log.persistence.error("Save failed: \(error.localizedDescription, privacy: .public)")
+                Log.persistence.error("Save failed: \(error.localizedDescription, privacy: .private)")
             }
         }
     }
@@ -390,14 +405,14 @@ final class PersistenceManager {
         do {
             data = try Data(contentsOf: url)
         } catch {
-            Log.persistence.error("Failed to read history file: \(error.localizedDescription, privacy: .public)")
+            Log.persistence.error("Failed to read history file: \(error.localizedDescription, privacy: .private)")
             return []
         }
         let decrypted: Data
         do {
             decrypted = try KeyManager.shared.decrypt(data)
         } catch {
-            Log.persistence.error("Decrypt failed; quarantining file. \(error.localizedDescription, privacy: .public)")
+            Log.persistence.error("Decrypt failed; quarantining file. \(error.localizedDescription, privacy: .private)")
             quarantine(url: url)
             return []
         }
@@ -418,9 +433,9 @@ final class PersistenceManager {
         let target = url.deletingLastPathComponent().appendingPathComponent("history.broken-\(ts)")
         do {
             try FileManager.default.moveItem(at: url, to: target)
-            Log.persistence.info("Quarantined corrupt history to \(target.lastPathComponent, privacy: .public)")
+            Log.persistence.info("Quarantined corrupt history to \(target.lastPathComponent, privacy: .private)")
         } catch {
-            Log.persistence.error("Quarantine failed: \(error.localizedDescription, privacy: .public)")
+            Log.persistence.error("Quarantine failed: \(error.localizedDescription, privacy: .private)")
         }
     }
 }
@@ -434,7 +449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         // 1. Encryption key must exist before persistence load.
         do { try KeyManager.shared.ensureKeyExists() }
-        catch { Log.crypto.error("ensureKeyExists failed: \(error.localizedDescription, privacy: .public)") }
+        catch { Log.crypto.error("ensureKeyExists failed: \(error.localizedDescription, privacy: .private)") }
 
         // 2. Load persisted history.
         itemsVM = ItemsViewModel()

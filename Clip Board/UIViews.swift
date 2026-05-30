@@ -263,15 +263,20 @@ struct ContentView: View {
     }
 
     /// Single-pass snapshot of items split into pinned/unpinned display buckets.
-    /// Replaces the previous seven-stage cascade; one O(n) walk + one prefix.
-    private struct Snapshot {
+    /// Stored in `@State` and recomputed only when its inputs change (items, search,
+    /// visible-limit) so the body recomputation triggered by hover / selection /
+    /// preview-id changes doesn't repeat the O(n) filter on every tick.
+    private struct Snapshot: Equatable {
         var ordered: [ClipItem]
         var displayPinned: [ClipItem]
         var displayUnpinned: [ClipItem]
         var displayItems: [ClipItem] { displayPinned + displayUnpinned }
     }
 
-    private var snapshot: Snapshot {
+    @State private var snapshotState = Snapshot(ordered: [], displayPinned: [], displayUnpinned: [])
+    private var snapshot: Snapshot { snapshotState }
+
+    private func recomputeSnapshot() {
         let q = debouncedSearchText.trimmingCharacters(in: .whitespacesAndNewlines)
         var pinned: [ClipItem] = []
         var unpinned: [ClipItem] = []
@@ -282,9 +287,12 @@ struct ContentView: View {
         let ordered = pinned + unpinned
         let limit = min(visibleLimit, maxVisible, ordered.count)
         let pinnedInDisplay = min(pinned.count, limit)
-        let displayPinned = Array(pinned.prefix(pinnedInDisplay))
-        let displayUnpinned = Array(unpinned.prefix(limit - pinnedInDisplay))
-        return Snapshot(ordered: ordered, displayPinned: displayPinned, displayUnpinned: displayUnpinned)
+        let next = Snapshot(
+            ordered: ordered,
+            displayPinned: Array(pinned.prefix(pinnedInDisplay)),
+            displayUnpinned: Array(unpinned.prefix(limit - pinnedInDisplay))
+        )
+        if next != snapshotState { snapshotState = next }
     }
 
     private func isRecentlyCopied(_ id: UUID) -> Bool {
@@ -425,7 +433,10 @@ struct ContentView: View {
                 .onKeyDown(handleKeyEvent(_:))
             }
         }
-        .onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { searchFocused = true } }
+        .onAppear {
+            recomputeSnapshot()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { searchFocused = true }
+        }
         .onChange(of: searchText) { _, newValue in
             searchDebounceTask?.cancel()
             if newValue.isEmpty { debouncedSearchText = ""; visibleLimit = 30; return }
@@ -433,6 +444,9 @@ struct ContentView: View {
             searchDebounceTask = task
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: task)
         }
+        .onChange(of: itemsVM.items) { _, _ in recomputeSnapshot() }
+        .onChange(of: debouncedSearchText) { _, _ in recomputeSnapshot() }
+        .onChange(of: visibleLimit) { _, _ in recomputeSnapshot() }
         .confirmationDialog(
             pendingClear == .all ? "Clear all items, including pinned?" : "Clear all unpinned items?",
             isPresented: Binding(
@@ -1062,7 +1076,7 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
         hosting.translatesAutoresizingMaskIntoConstraints = false
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 340, height: 500),
+            contentRect: NSRect(x: 0, y: 0, width: HistoryUI.panelWidth, height: HistoryUI.panelHeight),
             styleMask: [.nonactivatingPanel, .fullSizeContentView, .titled],
             backing: .buffered,
             defer: false
@@ -1098,8 +1112,8 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
             hosting.trailingAnchor.constraint(equalTo: containerView.trailingAnchor),
             hosting.topAnchor.constraint(equalTo: containerView.topAnchor),
             hosting.bottomAnchor.constraint(equalTo: containerView.bottomAnchor),
-            containerView.widthAnchor.constraint(equalToConstant: 340),
-            containerView.heightAnchor.constraint(equalToConstant: 500)
+            containerView.widthAnchor.constraint(equalToConstant: HistoryUI.panelWidth),
+            containerView.heightAnchor.constraint(equalToConstant: HistoryUI.panelHeight)
         ])
 
         self.window = panel
@@ -1108,11 +1122,20 @@ final class HistoryWindowController: NSObject, NSWindowDelegate {
     }
 
     private func positionPanel(_ panel: NSPanel, at screenPoint: NSPoint) {
-        guard let screen = NSScreen.main else { return }
-        let halfW: CGFloat = 170
-        var origin = NSPoint(x: screenPoint.x - halfW, y: screenPoint.y - 20 - 500)
+        // Pick the screen that actually contains the cursor, not the key-window screen.
+        // On a multi-monitor setup `NSScreen.main` would clamp the panel onto the wrong
+        // display when the user invokes the hotkey from another monitor.
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(screenPoint) })
+            ?? NSScreen.main
+            ?? NSScreen.screens.first
+        guard let screen else { return }
+        let halfW = HistoryUI.panelWidth / 2
+        var origin = NSPoint(
+            x: screenPoint.x - halfW,
+            y: screenPoint.y - 20 - HistoryUI.panelHeight
+        )
         let visible = screen.visibleFrame
-        origin.x = max(visible.minX + 8, min(origin.x, visible.maxX - 340 - 8))
+        origin.x = max(visible.minX + 8, min(origin.x, visible.maxX - HistoryUI.panelWidth - 8))
         origin.y = max(visible.minY + 8, min(origin.y, visible.maxY - 8))
         panel.setFrameOrigin(origin)
     }
