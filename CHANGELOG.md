@@ -29,7 +29,7 @@ All notable changes to this project are documented here. Format loosely follows 
 - **Multi-select mode** — right-click any row → *Select* enters multi-select. Click anywhere on a row to toggle its selection (no leading checkboxes); a stronger accent tint plus a trailing checkmark indicates selected rows. The Clear button morphs into Cancel + **Delete N**. Esc exits the mode.
 - **Confirmation dialog on Clear** — system-style sheet asks before destroying history; Return triggers the destructive action, Esc cancels. ⌥-click variant uses a stronger warning ("Clear all items, including pinned?").
 - **Attribution footer** — "Clip-Board by Siddharth Sangwan" with a small clipboard glyph, centered at the bottom of the panel.
-- **Homebrew tap** — install via `brew install --cask light-house-group/tap/clip-board`.
+- **Homebrew tap** — install via `brew install --cask light-house-group/taps/clip-board`.
 
 ### Changed
 

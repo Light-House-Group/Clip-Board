@@ -56,10 +56,10 @@ Most clipboard managers either keep your history in plaintext, sync it to a clou
 ### Homebrew (recommended)
 
 ```bash
-brew install --cask light-house-group/tap/clip-board
+brew install --cask light-house-group/taps/clip-board
 ```
 
-This adds the `light-house-group/tap` tap once, downloads the signed zip, and installs `Clip Board.app` into `/Applications`. To update later:
+This adds the `light-house-group/taps` tap once, downloads the signed zip, and installs `Clip Board.app` into `/Applications`. To update later:
 
 ```bash
 brew update
@@ -95,14 +95,15 @@ The release binary is **ad-hoc signed**, so on first launch macOS Gatekeeper wil
 | :--- | :--- |
 | Show / hide history | Click menu-bar icon, or press the configured hotkey |
 | Copy + auto-paste into previous app | Click a row, or press ⏎ on the selection |
-| Copy only (no auto-paste) | Click the small clipboard icon at the right of a row |
-| Preview full text of a long item | Hover over the row for 1 second |
+| Copy without pasting | Right-click → Copy |
+| Preview full content (text or image) | Hover over a truncated row / image for 1 second |
 | Select text inside a preview | Click and drag inside the popover |
 | Pin / unpin an item | Right-click → Pin, or click the pin icon |
 | Delete an item | Right-click → Delete |
+| Select multiple, then delete | Right-click → Select, click rows, then **Delete N** |
 | Search | Type in the search field (debounced 180 ms) |
-| Clear unpinned items | Click the trash button |
-| Clear all (including pinned) | **⌥**-click the trash button |
+| Clear unpinned items | Click the trash button (confirms first) |
+| Clear all (including pinned) | **⌥**-click the trash button (confirms first) |
 | Navigate the list | ↑ / ↓ arrow keys |
 | Activate selection | ⏎ (Return) |
 | Close panel / dismiss preview | ⎋ (Escape) |
