@@ -75,6 +75,9 @@ struct VisualEffectView: NSViewRepresentable {
         view.isEmphasized = isEmphasized
         view.wantsLayer = true
         view.layer?.cornerRadius = HistoryUI.cornerRadius
+        // Match SwiftUI's `.continuous` clip so the material's rounding is the same squircle
+        // as the overlay stroke — otherwise the two corner shapes disagree subtly.
+        view.layer?.cornerCurve = .continuous
         view.layer?.masksToBounds = true
         return view
     }
@@ -117,7 +120,10 @@ struct SharedHistoryRootView: View {
                     RoundedRectangle(cornerRadius: HistoryUI.cornerRadius, style: .continuous)
                         .strokeBorder(Color.white.opacity(0.08), lineWidth: 1)
                 )
-                .shadow(color: Color.black.opacity(0.18), radius: 14, x: 0, y: 8)
+                // Symmetric shadow: a large downward offset made the bottom corners read
+                // softer/rounder than the top. A near-centered glow keeps all four corners
+                // visually identical while still lifting the panel off the desktop.
+                .shadow(color: Color.black.opacity(0.22), radius: 18, x: 0, y: 2)
 
             // No drag grabber — the entire panel is draggable via
             // `isMovableByWindowBackground`, so the capsule was decorative-only
@@ -379,7 +385,7 @@ struct ContentView: View {
             // "Clipboard" title removed per design — search bar leads the panel.
             searchBar
                 .padding(.horizontal, HistoryUI.innerHorizontal)
-                .padding(.top, 20)
+                .padding(.top, 15)
                 .padding(.bottom, 8)
 
             Divider().opacity(0.6).padding(.bottom, 6)

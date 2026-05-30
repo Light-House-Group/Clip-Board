@@ -32,7 +32,7 @@ Most clipboard managers either keep your history in plaintext, sync it to a clou
 
 ## Features
 
-- **Global hotkey** (configurable, defaults to ⌃⌥⌘V) opens a floating panel anywhere.
+- **Global hotkey** (configurable, defaults to ⌥V) opens a floating panel anywhere.
 - **Menu-bar app** — no Dock icon. Left-click to open the panel, right-click for a context menu.
 - **Text and images.** Captures text plus any image on the clipboard (screenshots copied with `⌃` modifiers, images copied from browsers, etc.). Image rows render shrunk to the panel width; hover 1 s for a full-resolution scrollable preview. Click to copy + auto-paste it back.
 - **Encrypted at rest** with AES-GCM (256-bit). Key in Keychain, `WhenUnlockedThisDeviceOnly`, non-syncable. **Images are encrypted too** — each stored as its own encrypted file, never embedded in plaintext.
@@ -83,7 +83,7 @@ The release binary is **ad-hoc signed**, so on first launch macOS Gatekeeper wil
 ## First run
 
 1. The app launches as a menu-bar item. There is no Dock icon, no main window. Look for the clipboard glyph in your menu bar.
-2. **Left-click** the menu-bar icon, or press the default hotkey **⌃⌥⌘V**, to open the history panel.
+2. **Left-click** the menu-bar icon, or press the default hotkey **⌥V**, to open the history panel.
 3. On the first auto-paste attempt, macOS asks for **Accessibility permission** — required to synthesize ⌘V into the previous app. Without it, items still copy to the clipboard; you paste manually with ⌘V.
 4. **Right-click** the menu-bar icon to change the hotkey, toggle launch-at-login, or quit.
 

@@ -41,7 +41,7 @@ final class Preferences {
 
     static let defaultHotkey = HotkeyConfig(
         keyCode: UInt32(kVK_ANSI_V),
-        modifiers: UInt32(controlKey) | UInt32(optionKey) | UInt32(cmdKey)
+        modifiers: UInt32(optionKey)
     )
 
     var hotkey: HotkeyConfig {

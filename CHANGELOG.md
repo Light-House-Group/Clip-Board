@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.1] — 2026-05-30
+
+### Changed
+
+- **Default global shortcut is now ⌥V** (Option-V), changed from ⌃⌥⌘V. Existing installs keep whatever shortcut you've already configured — only fresh installs pick up the new default. Re-bind anytime via right-click → **Set Shortcut…**.
+- **Panel corners are now symmetric.** The drop shadow was offset downward, which made the bottom corners read rounder than the top; the glow is now near-centered and the glass material uses the continuous "squircle" corner curve, so all four corners match. Top padding tightened.
+
+[1.2.1]: https://github.com/Light-House-Group/Clip-Board/releases/tag/v1.2.1
+
 ## [1.2.0] — 2026-05-29
 
 ### Added
