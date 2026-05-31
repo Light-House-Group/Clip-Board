@@ -227,7 +227,10 @@ struct ContentView: View {
     @State private var visibleLimit: Int = 30
     private let maxVisible: Int = 200
     @State private var keyboardNavigated: Bool = false
+    /// Debounce so holding the arrow key doesn't spawn one popover per row as it scrolls past.
+    @State private var keyboardPreviewTask: DispatchWorkItem? = nil
     private let copyHighlightDuration: TimeInterval = 0.6
+    private let keyboardPreviewDelay: TimeInterval = 0.25
 
     // Multi-select mode — entered via row context-menu "Select".
     // Click anywhere on a row toggles its selection; no leading checkboxes.
@@ -293,6 +296,14 @@ struct ContentView: View {
             displayUnpinned: Array(unpinned.prefix(limit - pinnedInDisplay))
         )
         if next != snapshotState { snapshotState = next }
+
+        // If the previously-previewed item is no longer in the displayed set (filtered
+        // out by search or removed), dismiss the popover so it doesn't hover over an
+        // unrelated row or anchor to a stale geometry.
+        if let pid = previewItemID,
+           !next.displayItems.contains(where: { $0.id == pid }) {
+            previewItemID = nil
+        }
     }
 
     private func isRecentlyCopied(_ id: UUID) -> Bool {
@@ -430,6 +441,14 @@ struct ContentView: View {
                     guard keyboardNavigated, let id else { return }
                     keyboardNavigated = false
                     withAnimation(.easeInOut(duration: 0.15)) { proxy.scrollTo(id, anchor: .center) }
+                    // Open the preview popover for the keyboard-selected row, debounced
+                    // so rapid arrow-key scrolling doesn't flash a popover per row.
+                    // The popover's own gating (`previewEligible`) suppresses opening
+                    // for non-truncated text rows — image rows always open.
+                    keyboardPreviewTask?.cancel()
+                    let task = DispatchWorkItem { previewItemID = id }
+                    keyboardPreviewTask = task
+                    DispatchQueue.main.asyncAfter(deadline: .now() + keyboardPreviewDelay, execute: task)
                 }
                 .onKeyDown(handleKeyEvent(_:))
             }
@@ -527,6 +546,9 @@ struct ContentView: View {
     private func clearHistory(removePinned: Bool) {
         itemsVM.clearHistory(removePinned: removePinned)
         selectedID = nil
+        // Without this the popover would linger pointing at an item that no longer exists.
+        previewItemID = nil
+        keyboardPreviewTask?.cancel()
         copiedTimestamps.removeAll()
         searchText = ""
     }
@@ -537,7 +559,11 @@ struct ContentView: View {
             let ordered = snapshot.ordered
             guard !ordered.isEmpty else { return }
             keyboardNavigated = true
-            previewItemID = nil
+            // Close any open popover IMMEDIATELY so the previous row's preview doesn't
+            // linger; the debounced onChange(of: selectedID) will open the new row's
+            // preview after a short settling delay.
+            if previewItemID != nil { previewItemID = nil }
+            keyboardPreviewTask?.cancel()
             if let currentID = selectedID, let idx = ordered.firstIndex(where: { $0.id == currentID }) {
                 selectedID = ordered[min(idx + 1, ordered.count - 1)].id
             } else { selectedID = ordered.first?.id }
@@ -545,13 +571,16 @@ struct ContentView: View {
             let ordered = snapshot.ordered
             guard !ordered.isEmpty else { return }
             keyboardNavigated = true
-            previewItemID = nil
+            if previewItemID != nil { previewItemID = nil }
+            keyboardPreviewTask?.cancel()
             if let currentID = selectedID, let idx = ordered.firstIndex(where: { $0.id == currentID }) {
                 selectedID = ordered[max(idx - 1, 0)].id
             } else { selectedID = ordered.last?.id }
         case KeyCode.return:
+            keyboardPreviewTask?.cancel()
             if let id = selectedID { perform(action: .copy, id: id) }
         case KeyCode.escape:
+            keyboardPreviewTask?.cancel()
             if previewItemID != nil { previewItemID = nil }
             else if isMultiSelectMode { exitSelectMode() }
             else if !searchText.isEmpty { searchText = "" }
@@ -806,16 +835,8 @@ struct ClipRow: View {
 
 // MARK: - Preview preference keys
 
-/// Max-reducing CGFloat preference key, reused for content-size measurement.
+/// Max-reducing CGFloat preference key, used for FullTextPopover content-size measurement.
 private struct MaxCGFloatKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
-}
-private struct VisibleHeightKey: PreferenceKey {
-    static let defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
-}
-private struct FullHeightKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
 }
@@ -835,47 +856,66 @@ private struct GlassPopoverBackground: View {
 
 // MARK: - Truncating text (measures real truncation)
 
+/// Width-tracking preference key for the truncation measurement.
+private struct WidthKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = max(value, nextValue()) }
+}
+
 /// Renders text clipped to two lines, and reports — via `isTruncated` — whether the
-/// content is *actually* visually clipped at the current width. Compares the rendered
-/// (2-line) height against the full unconstrained height laid out at the same width.
+/// content is *actually* visually clipped at the current width.
+///
+/// Measurement uses `NSAttributedString.boundingRect` against the row's measured width
+/// with the same font as the rendered text, then counts how many lines that requires.
+/// > 2 lines ⇒ truncated. Deterministic: no SwiftUI dual-GeometryReader race, no
+/// sub-pixel slack heuristics. The prior implementation could flip `isTruncated = true`
+/// during the brief window where the unconstrained-height background measurement
+/// landed before the constrained foreground one, opening the hover popover for text
+/// that was fully visible in the row.
 private struct TruncatingText: View {
     let text: String
     @Binding var isTruncated: Bool
-    @State private var visibleH: CGFloat = 0
-    @State private var fullH: CGFloat = 0
+    @State private var measuredWidth: CGFloat = 0
+
+    private static let bodyFont = NSFont.systemFont(ofSize: 13)
+    private static let maxVisibleLines = 2
 
     var body: some View {
         Text(text)
-            .lineLimit(2)
+            .lineLimit(Self.maxVisibleLines)
             .truncationMode(.tail)
             .font(.system(size: 13))
             .foregroundColor(.primary)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(GeometryReader { g in
-                Color.clear.preference(key: VisibleHeightKey.self, value: g.size.height)
+                Color.clear.preference(key: WidthKey.self, value: g.size.width)
             })
-            .background(
-                // Hidden, unconstrained-height copy laid out at the same width.
-                Text(text)
-                    .font(.system(size: 13))
-                    .fixedSize(horizontal: false, vertical: true)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .hidden()
-                    .background(GeometryReader { g in
-                        Color.clear.preference(key: FullHeightKey.self, value: g.size.height)
-                    })
-            )
-            .onPreferenceChange(VisibleHeightKey.self) { v in visibleH = v; recompute() }
-            .onPreferenceChange(FullHeightKey.self) { f in fullH = f; recompute() }
+            .onPreferenceChange(WidthKey.self) { w in
+                guard w > 0 else { return }
+                if abs(w - measuredWidth) > 0.5 {
+                    measuredWidth = w
+                    recompute(width: w)
+                }
+            }
+            .onChange(of: text) { _, _ in
+                if measuredWidth > 0 { recompute(width: measuredWidth) }
+            }
     }
 
-    private func recompute() {
-        // Sub-pixel rounding and font-metric quirks can make a non-truncated 2-line
-        // block measure 0.5–2 pt taller via the unconstrained background than via
-        // the lineLimit foreground. A generous slack (half a line at 13pt body =
-        // ~8pt) ensures only genuine clipping flags as truncation, so the hover
-        // preview never opens for text already fully visible in the row.
-        let truncated = fullH > visibleH + 8
+    private func recompute(width: CGFloat) {
+        let attr = NSAttributedString(
+            string: text,
+            attributes: [.font: Self.bodyFont]
+        )
+        let rect = attr.boundingRect(
+            with: NSSize(width: width, height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin, .usesFontLeading]
+        )
+        // Line count = ceil(height / line-height), with a small epsilon so a single
+        // line that measures fractionally over isn't counted as two.
+        let lineHeight = Self.bodyFont.boundingRectForFont.height
+        let lines = max(1, Int(ceil(rect.height / lineHeight - 0.01)))
+        let truncated = lines > Self.maxVisibleLines
         guard truncated != isTruncated else { return }
         DispatchQueue.main.async { isTruncated = truncated }
     }
