@@ -37,13 +37,19 @@ nonisolated struct ClipItem: Identifiable, Codable, Equatable {
     var sourceBundleID: String? = nil  // bundle id of the app the copy came from
     var sourceAppName: String? = nil   // localized name of that app
 
+    // Added in 1.2.4 — additional pasteboard representations captured at copy time
+    // (RTF / RTFD / HTML / etc.), keyed by pasteboard-type identifier. Restored on
+    // paste so the target app pastes at the highest fidelity it understands. Optional
+    // so plain-text items from older histories decode unchanged.
+    var richRepresentations: [String: Data]? = nil
+
     var resolvedKind: ClipKind { kind ?? .text }
     var isImage: Bool { resolvedKind == .image }
 }
 
 /// What the clipboard watcher captured on a single pasteboard change.
 nonisolated enum CapturedItem {
-    case text(String, sourceBundleID: String?, sourceAppName: String?)
+    case text(String, richRepresentations: [String: Data]?, sourceBundleID: String?, sourceAppName: String?)
     case image(png: Data, width: Int, height: Int, sourceBundleID: String?, sourceAppName: String?)
 }
 
@@ -51,13 +57,16 @@ nonisolated enum CapturedItem {
 
 final class ItemsViewModel: ObservableObject {
     @Published private(set) var items: [ClipItem] = []
-    private let limit = 100
     /// Per-item character cap for TEXT items. Beyond this the stored text is truncated with
     /// a marker so a single multi-megabyte copy can't bloat the encrypted history file.
     private static let maxItemChars = 100_000
     private static let truncationMarker = "\n\n[…truncated by Clip-Board]"
     /// Hard ceiling on a single stored image (bytes of PNG). Larger images are dropped.
     private static let maxImageBytes = 25_000_000
+    /// Hard ceiling on the combined size of one item's rich-text representations.
+    /// RTF / RTFD / HTML can be many KB; this prevents a pathological copy from
+    /// inflating the encrypted history file far beyond the user's expectations.
+    private static let maxRichBytesPerItem = 500_000
 
     private let saveSubject = PassthroughSubject<Void, Never>()
     private var cancellables: Set<AnyCancellable> = []
@@ -77,6 +86,15 @@ final class ItemsViewModel: ObservableObject {
                 PersistenceManager.shared.save(items: self.items)
             }
             .store(in: &cancellables)
+
+        // Re-trim when the user changes the history-size preference from the menu.
+        NotificationCenter.default.addObserver(
+            forName: Preferences.historySizeChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            self.trimIfNeeded()
+            self.scheduleSave()
+        }
     }
 
     private func scheduleSave() { saveSubject.send(()) }
@@ -85,8 +103,11 @@ final class ItemsViewModel: ObservableObject {
     /// pasting from history reproduces what the user actually copied — important for things
     /// like ` --flag`, ` :`, or anything where a leading/trailing space carries meaning.
     /// Truncates beyond `maxItemChars`. Dedupes by exact-equal stored text (an existing match
-    /// moves to the top and refreshes its date + source app).
-    func addText(_ text: String, sourceBundleID: String? = nil, sourceAppName: String? = nil) {
+    /// moves to the top and refreshes its date + source app + rich-text representations).
+    func addText(_ text: String,
+                 richRepresentations: [String: Data]? = nil,
+                 sourceBundleID: String? = nil,
+                 sourceAppName: String? = nil) {
         // Skip all-whitespace copies, but DO NOT mutate the stored value with trim.
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
@@ -97,11 +118,22 @@ final class ItemsViewModel: ObservableObject {
             stored = text
         }
 
+        // Drop rich payloads if their combined size exceeds the per-item cap — the plain
+        // text path still works, the user just doesn't get formatting on re-paste.
+        let reps: [String: Data]? = {
+            guard let r = richRepresentations, !r.isEmpty else { return nil }
+            let total = r.values.reduce(0) { $0 + $1.count }
+            return total <= Self.maxRichBytesPerItem ? r : nil
+        }()
+
         if let existingIndex = items.firstIndex(where: { !$0.isImage && $0.text == stored }) {
             var existing = items.remove(at: existingIndex)
             existing.date = Date()
             existing.sourceBundleID = sourceBundleID ?? existing.sourceBundleID
             existing.sourceAppName = sourceAppName ?? existing.sourceAppName
+            // Most-recent capture wins for formatting too — if the new copy has rich
+            // representations and the old one didn't (or vice versa), prefer the new.
+            existing.richRepresentations = reps ?? existing.richRepresentations
             items.insert(existing, at: 0)
             scheduleSave()
             return
@@ -110,7 +142,8 @@ final class ItemsViewModel: ObservableObject {
         let newItem = ClipItem(
             id: UUID(), text: stored, date: Date(), pinned: false,
             kind: .text,
-            sourceBundleID: sourceBundleID, sourceAppName: sourceAppName
+            sourceBundleID: sourceBundleID, sourceAppName: sourceAppName,
+            richRepresentations: reps
         )
         items.insert(newItem, at: 0)
         trimIfNeeded()
@@ -180,6 +213,7 @@ final class ItemsViewModel: ObservableObject {
     }
 
     private func trimIfNeeded() {
+        let limit = Preferences.shared.historySize
         let nonPinned = items.filter { !$0.pinned }
         if nonPinned.count > limit {
             let toRemove = Array(nonPinned.dropFirst(limit))
@@ -245,6 +279,18 @@ final class ClipboardWatcher {
         timer = nil
     }
 
+    /// Standard text-class pasteboard types we capture in addition to `.string`, so a
+    /// re-paste from history preserves the original formatting. Limited to well-known
+    /// public types — we deliberately don't capture arbitrary custom UTIs (privacy +
+    /// bloat risk; app-specific binary payloads can encode private metadata).
+    private static let richTextTypes: [NSPasteboard.PasteboardType] = [
+        .rtf,
+        .rtfd,
+        .html,
+        NSPasteboard.PasteboardType("public.utf16-external-plain-text"),
+        NSPasteboard.PasteboardType("public.utf16-plain-text")
+    ]
+
     private func checkClipboard() {
         let pb = NSPasteboard.general
         let change = pb.changeCount
@@ -276,7 +322,19 @@ final class ClipboardWatcher {
             guard !trimmed.isEmpty else { return }
             guard trimmed != lastStoredText else { return }
             lastStoredText = trimmed
-            onNew?(.text(raw, sourceBundleID: srcBundle, sourceAppName: srcName))
+
+            // Collect any rich-text flavors the source app published. Bytes-only so
+            // the encrypted history file can store them without further serialization.
+            var richReps: [String: Data] = [:]
+            for type in Self.richTextTypes where types.contains(type) {
+                if let data = pb.data(forType: type) {
+                    richReps[type.rawValue] = data
+                }
+            }
+            let representations: [String: Data]? = richReps.isEmpty ? nil : richReps
+
+            onNew?(.text(raw, richRepresentations: representations,
+                         sourceBundleID: srcBundle, sourceAppName: srcName))
             return
         }
 
@@ -438,9 +496,20 @@ final class AutoPaster {
         }
     }
 
-    /// Copies `text` to the clipboard, then pastes into the previously active app.
+    /// Copies `text` to the clipboard (plain only), then pastes into the previously active app.
+    /// Use the `item:` overload to also restore the original RTF/HTML/RTFD formatting.
     static func pasteIntoPreviousApp(text: String) {
         NSPasteboard.general.copyString(text)
+        deliverPaste()
+    }
+
+    /// Copies `item.text` plus any captured rich-text representations (RTF, RTFD, HTML)
+    /// to the clipboard, then pastes into the previously active app. The target app
+    /// picks the highest-fidelity representation it understands; apps that only accept
+    /// plain text still get the string form.
+    static func pasteIntoPreviousApp(item: ClipItem) {
+        NSPasteboard.general.copyRichText(plain: item.text,
+                                          representations: item.richRepresentations)
         deliverPaste()
     }
 
@@ -561,6 +630,21 @@ extension NSPasteboard {
     func copyString(_ string: String) {
         clearContents()
         setString(string, forType: .string)
+        ClipboardWatcher.suppressNextChange()
+    }
+
+    /// Writes the plain-text form plus any captured rich-text representations
+    /// (RTF, RTFD, HTML, etc.) so the target app can paste at the highest fidelity
+    /// it supports. The plain form is always written so a paste in a plain-text
+    /// field still works. Suppresses the resulting watcher echo.
+    func copyRichText(plain: String, representations: [String: Data]?) {
+        clearContents()
+        setString(plain, forType: .string)
+        if let reps = representations {
+            for (rawType, data) in reps where rawType != NSPasteboard.PasteboardType.string.rawValue {
+                setData(data, forType: NSPasteboard.PasteboardType(rawType))
+            }
+        }
         ClipboardWatcher.suppressNextChange()
     }
 

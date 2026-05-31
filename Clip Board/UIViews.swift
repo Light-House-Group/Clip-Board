@@ -326,11 +326,12 @@ struct ContentView: View {
                     }
                 }
             } else {
-                let text = item.text
+                let pasteItem = item
                 // Defer slightly so the panel finishes ordering out before we activate the
-                // previous app and synthesize Cmd-V into it.
+                // previous app and synthesize Cmd-V into it. The item-aware overload
+                // restores any captured RTF/RTFD/HTML so styled copies paste at fidelity.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    AutoPaster.pasteIntoPreviousApp(text: text)
+                    AutoPaster.pasteIntoPreviousApp(item: pasteItem)
                 }
             }
         }
@@ -585,10 +586,13 @@ struct ClipRow: View {
     private static let imageRowMaxHeight: CGFloat = 200
 
     /// Bound to the popover; reads/writes the parent's shared `previewItemID`
-    /// so only one preview is visible across the whole list at a time.
+    /// so only one preview is visible across the whole list at a time. Gated on
+    /// `previewEligible` so that even if some upstream sets `previewItemID` to a
+    /// non-truncated row, no popover is shown — the full text is already visible
+    /// in the row itself.
     private var showPreview: Binding<Bool> {
         Binding(
-            get: { previewItemID == item.id },
+            get: { previewItemID == item.id && previewEligible },
             set: { isOn in
                 if isOn { previewItemID = item.id }
                 else if previewItemID == item.id { previewItemID = nil }
@@ -866,7 +870,12 @@ private struct TruncatingText: View {
     }
 
     private func recompute() {
-        let truncated = fullH > visibleH + 1
+        // Sub-pixel rounding and font-metric quirks can make a non-truncated 2-line
+        // block measure 0.5–2 pt taller via the unconstrained background than via
+        // the lineLimit foreground. A generous slack (half a line at 13pt body =
+        // ~8pt) ensures only genuine clipping flags as truncation, so the hover
+        // preview never opens for text already fully visible in the row.
+        let truncated = fullH > visibleH + 8
         guard truncated != isTruncated else { return }
         DispatchQueue.main.async { isTruncated = truncated }
     }
@@ -1223,6 +1232,24 @@ final class MenuBarController: NSObject {
         launch.state = Preferences.shared.launchAtLogin ? .on : .off
         menu.addItem(launch)
 
+        // History size — submenu with curated presets. The selected preset is checked;
+        // if the stored value isn't one of the presets (hand-edited), no item is checked
+        // but the submenu title still shows the current value so the state is visible.
+        let current = Preferences.shared.historySize
+        let historyItem = NSMenuItem(title: "History Size: \(current)", action: nil, keyEquivalent: "")
+        let historyMenu = NSMenu()
+        for size in Preferences.historySizePresets {
+            let sub = NSMenuItem(title: "\(size) items",
+                                 action: #selector(menuSetHistorySize(_:)),
+                                 keyEquivalent: "")
+            sub.target = self
+            sub.tag = size
+            sub.state = (size == current) ? .on : .off
+            historyMenu.addItem(sub)
+        }
+        historyItem.submenu = historyMenu
+        menu.addItem(historyItem)
+
         menu.addItem(.separator())
 
         let quit = NSMenuItem(title: "Quit Clip Board", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -1244,6 +1271,13 @@ final class MenuBarController: NSObject {
 
     @objc private func menuToggleLaunchAtLogin() {
         Preferences.shared.launchAtLogin.toggle()
+    }
+
+    @objc private func menuSetHistorySize(_ sender: NSMenuItem) {
+        let size = sender.tag
+        guard size > 0 else { return }
+        // Setter posts Preferences.historySizeChanged; ItemsViewModel listens and re-trims.
+        Preferences.shared.historySize = size
     }
 
     @objc private func menuSetShortcut() {

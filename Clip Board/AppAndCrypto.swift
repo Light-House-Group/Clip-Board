@@ -28,10 +28,14 @@ final class Preferences {
     private init() {}
     private let defaults = UserDefaults.standard
 
+    /// Posted when `historySize` changes. ItemsViewModel listens for this and re-trims.
+    static let historySizeChanged = Notification.Name("com.clipboard.manager.historySizeChanged")
+
     private enum Keys {
         static let hotkeyCode    = "hotkey.keyCode"
         static let hotkeyMods    = "hotkey.modifiers"
         static let launchAtLogin = "launchAtLogin"
+        static let historySize   = "historySize"
     }
 
     struct HotkeyConfig: Equatable {
@@ -43,6 +47,13 @@ final class Preferences {
         keyCode: UInt32(kVK_ANSI_V),
         modifiers: UInt32(optionKey)
     )
+
+    /// Allowed history-size presets shown in the menu. Anything outside this set still
+    /// works (the getter accepts any positive int from defaults), but the UI surfaces
+    /// these so users don't pick pathological values. No "Unlimited" — truly unbounded
+    /// history breaks search latency, scroll perf, and per-save encryption time.
+    static let historySizePresets = [50, 100, 250, 500, 1000]
+    static let defaultHistorySize = 100
 
     var hotkey: HotkeyConfig {
         get {
@@ -61,6 +72,21 @@ final class Preferences {
         set {
             defaults.set(newValue, forKey: Keys.launchAtLogin)
             applyLaunchAtLogin(newValue)
+        }
+    }
+
+    /// Max number of unpinned items kept in history. Pinned items are always preserved.
+    /// Clamped to [10, 5000] on read to guarantee a sane bound even if the stored value
+    /// has been hand-edited.
+    var historySize: Int {
+        get {
+            let raw = defaults.object(forKey: Keys.historySize) as? Int ?? Self.defaultHistorySize
+            return max(10, min(5000, raw))
+        }
+        set {
+            let clamped = max(10, min(5000, newValue))
+            defaults.set(clamped, forKey: Keys.historySize)
+            NotificationCenter.default.post(name: Self.historySizeChanged, object: nil)
         }
     }
 
@@ -518,8 +544,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ClipboardWatcher.shared.start { [weak self] captured in
             guard let vm = self?.itemsVM else { return }
             switch captured {
-            case let .text(text, bundleID, appName):
-                vm.addText(text, sourceBundleID: bundleID, sourceAppName: appName)
+            case let .text(text, reps, bundleID, appName):
+                vm.addText(text, richRepresentations: reps,
+                           sourceBundleID: bundleID, sourceAppName: appName)
             case let .image(png, width, height, bundleID, appName):
                 vm.addImage(png: png, width: width, height: height,
                             sourceBundleID: bundleID, sourceAppName: appName)

@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.4] — 2026-05-31
+
+### Added
+
+- **Original formatting is preserved on copy and paste.** When you copy styled text — from Mail, Notes, Pages, a browser, an IDE — Clip-Board now captures every standard text-class representation the source app published (`public.rtf`, `public.rtfd`, `public.html`, UTF-16 plain text) alongside the plain UTF-8 form. On paste from history, all representations are written back to the system pasteboard so the receiving app picks the highest-fidelity flavor it understands. Apps that only accept plain text still paste plain. Per-item rich payload is capped at 500 KB so a single styled copy can't bloat the encrypted store.
+- **Right-click → History Size submenu.** Choose between **50 / 100 / 250 / 500 / 1000** items. The currently active preset is check-marked, and the title shows the current value. Lowering the cap immediately trims the oldest unpinned items; pinned items are always preserved regardless of cap. No "Unlimited" option — truly unbounded history breaks search latency, scroll perf, and per-save encryption time; the 5000-item internal ceiling on stored values is the hard backstop.
+
+### Fixed
+
+- **Hover preview no longer opens for text that's already fully visible.** The previous truncation check used a 1 pt slack and could mis-flag short text as truncated due to sub-pixel font-metric rounding (especially at 13 pt body, where the `lineLimit(2)` foreground and the unconstrained-height background can disagree by ~2 pt on a row that genuinely fits). Slack widened to 8 pt — half a line — so only genuine clipping triggers the popover. The `.popover` binding is also gated on `previewEligible` defensively, so any upstream state set on a non-eligible row is ignored. Image rows still preview on hover, unchanged.
+
+### Changed
+
+- History size limit (formerly a hardcoded `100`) is now a Preferences value; default stays `100`. Existing installs are unaffected.
+- Storage schema gains an optional `richRepresentations: [String: Data]?` field on `ClipItem`. Backward-compatible — older items decode with the field absent and continue to paste plain text. No migration required.
+
+[1.2.4]: https://github.com/Light-House-Group/Clip-Board/releases/tag/v1.2.4
+
 ## [1.2.3] — 2026-05-31
 
 ### Fixed
