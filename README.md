@@ -142,11 +142,12 @@ Two verification commands you can run on any downloaded release:
 # 1. Linked libraries — should contain only Apple system frameworks.
 otool -L "Clip Board.app/Contents/MacOS/Clip Board"
 
-# 2. Sandbox entitlements — should show network.client and network.server as <false/>.
+# 2. Entitlements — should show network.client and network.server as <false/>,
+#    and app-sandbox as <false/> (see SECURITY.md for why we're unsandboxed).
 codesign -d --entitlements - "Clip Board.app"
 ```
 
-The entitlements file is checked into the repo at [`Clip Board/Clip Board.entitlements`](Clip%20Board/Clip%20Board.entitlements) — the source of truth a reviewer can diff against the signed binary.
+The entitlements file is checked into the repo at [`Clip Board/Clip Board.entitlements`](Clip%20Board/Clip%20Board.entitlements) — the source of truth a reviewer can diff against the signed binary. **Note:** Clip-Board is not sandboxed, because the macOS App Sandbox blocks `NSRunningApplication.activate()` on a foreign app — which silently breaks auto-paste. Every shipping clipboard manager (Maccy, Paste, Alfred, Raycast) runs unsandboxed for the same reason. See [SECURITY.md](SECURITY.md#sandbox--entitlements) for the full rationale and the hardening we apply in lieu of the sandbox (hardened runtime, no network linkage, AES-GCM at rest, Keychain key).
 
 ### Auto-paste and the Accessibility permission
 
@@ -182,7 +183,7 @@ The floating panel and the menu-bar window share the same SwiftUI root (`SharedH
 1. You copy text → macOS pasteboard updates → `changeCount` increments.
 2. `ClipboardWatcher` polls every 500 ms, detects the change, **skips transient/concealed types**.
 3. Trimmed text → `ItemsViewModel.addItem` → dedupe (move-to-top on exact match) or insert.
-4. After a 300 ms debounce, the items array is snapshotted on the main thread, then handed to the IO queue: **encode → AES-GCM encrypt → atomic write** to the app's sandboxed Application Support directory (`~/Library/Containers/Siddharth.Sangwa.ClipBoard/Data/Library/Application Support/ClipboardManager/history.json.enc` — sandboxed apps can't reach the global `~/Library/Application Support`), file mode `0600`, directory mode `0700`.
+4. After a 300 ms debounce, the items array is snapshotted on the main thread, then handed to the IO queue: **encode → AES-GCM encrypt → atomic write** to `~/Library/Application Support/ClipboardManager/history.json.enc`, file mode `0600`, directory mode `0700`. (Releases ≤ 1.2.2 ran sandboxed and stored under `~/Library/Containers/Siddharth.Sangwa.ClipBoard/Data/Library/Application Support/ClipboardManager/` — 1.2.3 migrates that payload on first launch.)
 5. On launch: load file → decrypt → decode. If anything fails, **quarantine** to `history.broken-<timestamp>` and start fresh.
 
 History is wrapped as `{"version": 1, "items": [...]}` for forward compatibility. The legacy unversioned format is migrated transparently.

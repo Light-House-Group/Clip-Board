@@ -192,10 +192,10 @@ final class KeyManager {
 
 /// Centralized on-disk locations, each created with tight permissions once at first use.
 ///
-/// Under the app sandbox, `applicationSupportDirectory` resolves to the container path
-/// (`~/Library/Containers/<bundle-id>/Data/Library/Application Support/ClipboardManager`),
-/// not the global `~/Library/Application Support`. Either way, it's per-user and
-/// inaccessible to other apps without the user explicitly granting access.
+/// Resolves to `~/Library/Application Support/ClipboardManager`. The directory is created
+/// 0700 on first access so other users on the machine can't read it. (Releases 1.0.0–1.2.2
+/// ran sandboxed and stored under `~/Library/Containers/<bundle-id>/Data/...`; 1.2.3+ is
+/// unsandboxed and migrates the old container payload via `migrateLegacyContainerIfNeeded()`.)
 enum AppPaths {
     /// `…/Application Support/ClipboardManager` (0700). Cached — created once.
     static let base: URL = {
@@ -213,6 +213,53 @@ enum AppPaths {
         ensureDirectory(folder)
         return folder
     }()
+
+    /// One-time migration of pre-1.2.3 sandbox-container history into the unsandboxed
+    /// Application Support location. Idempotent and safe: only runs when the destination
+    /// has no encrypted history yet and a legacy container payload exists. Never overwrites
+    /// newer data; never deletes the source (so a downgrade still finds the old store).
+    /// Call once at launch, BEFORE the persistence manager loads.
+    static func migrateLegacyContainerIfNeeded() {
+        let fm = FileManager.default
+        let historyName = "history.json.enc"
+        let destHistory = base.appendingPathComponent(historyName)
+        if fm.fileExists(atPath: destHistory.path) { return }
+
+        // Reconstruct the old sandbox container path manually — it's a regular path in
+        // the user's home directory; we just hard-code the bundle ID component.
+        // NOTE: appendingPathComponent percent-encodes embedded slashes, so chain one
+        // component per call (passing "Library/Containers" as one arg is wrong).
+        guard let bundleID = Bundle.main.bundleIdentifier else { return }
+        guard let home = ProcessInfo.processInfo.environment["HOME"].map(URL.init(fileURLWithPath:)) else { return }
+        let legacy = home
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Containers", isDirectory: true)
+            .appendingPathComponent(bundleID, isDirectory: true)
+            .appendingPathComponent("Data", isDirectory: true)
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Application Support", isDirectory: true)
+            .appendingPathComponent("ClipboardManager", isDirectory: true)
+        let legacyHistory = legacy.appendingPathComponent(historyName)
+        guard fm.fileExists(atPath: legacyHistory.path) else { return }
+
+        Log.app.notice("Migrating legacy sandbox-container history into Application Support.")
+        do {
+            try fm.copyItem(at: legacyHistory, to: destHistory)
+        } catch {
+            Log.app.error("Legacy history copy failed: \(error.localizedDescription, privacy: .private)")
+            return
+        }
+        // Carry images over too if present.
+        let legacyImages = legacy.appendingPathComponent("images", isDirectory: true)
+        if let names = try? fm.contentsOfDirectory(atPath: legacyImages.path) {
+            for name in names {
+                let src = legacyImages.appendingPathComponent(name)
+                let dst = imagesFolder.appendingPathComponent(name)
+                if fm.fileExists(atPath: dst.path) { continue }
+                try? fm.copyItem(at: src, to: dst)
+            }
+        }
+    }
 
     private static func ensureDirectory(_ url: URL) {
         let fm = FileManager.default
@@ -447,6 +494,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var menuBarController: MenuBarController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // 0. One-time migration of pre-1.2.3 sandbox-container history into the
+        //    unsandboxed Application Support directory. No-op after first run.
+        //    Runs BEFORE KeyManager: a re-signed binary can trigger a modal Keychain
+        //    re-authorization prompt that blocks ensureKeyExists for the first few
+        //    seconds, and we don't want migration gated on the user dismissing it.
+        AppPaths.migrateLegacyContainerIfNeeded()
+
         // 1. Encryption key must exist before persistence load.
         do { try KeyManager.shared.ensureKeyExists() }
         catch { Log.crypto.error("ensureKeyExists failed: \(error.localizedDescription, privacy: .private)") }

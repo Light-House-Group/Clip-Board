@@ -59,10 +59,22 @@ When you select an item, Clip-Board writes it to `NSPasteboard.general` (the sys
 
 ## Sandbox & entitlements
 
-The app is sandboxed (`com.apple.security.app-sandbox = true`) with **network entitlements explicitly disabled** (`com.apple.security.network.client = false`, `com.apple.security.network.server = false`). The entitlements file is checked into the repo at [`Clip Board/Clip Board.entitlements`](Clip%20Board/Clip%20Board.entitlements); reviewers can verify the signed binary against it with:
+**Clip-Board is not sandboxed**, and this is intentional. The macOS App Sandbox blocks `NSRunningApplication.activate()` on a foreign app, which makes "bring your last-focused app back to front, then synthesize ⌘V into it" silently fail. Every shipping clipboard manager that does cross-app paste injection (Maccy, Paste, Alfred, Raycast) runs unsandboxed for the same reason. Releases prior to 1.2.3 shipped with `app-sandbox = true` set in the project; that was a packaging carry-over from the Xcode template, not a security decision, and it broke auto-paste. As of 1.2.3 the entitlements file explicitly sets it to `false` with an in-file comment explaining why.
 
-```bash
-codesign -d --entitlements - "Clip Board.app"
-```
+What we still do for hardening, in lieu of the sandbox:
+
+- **Hardened runtime ON** (`ENABLE_HARDENED_RUNTIME = YES`) — Library Validation is enforced.
+- **No network entitlements requested or used.** The binary does not link `Network.framework`, `CFNetwork` (except via system Foundation, which is unavoidable but unused for outbound), or third-party HTTP libraries. Verify yourself:
+  ```bash
+  otool -L "Clip Board.app/Contents/MacOS/Clip Board"
+  ```
+  Only Apple system frameworks should be listed.
+- **Network client/server entitlements explicitly `false`** in the checked-in entitlements file at [`Clip Board/Clip Board.entitlements`](Clip%20Board/Clip%20Board.entitlements). These are defaults, but stating them explicitly means a reviewer can diff source vs. signed binary and confirm intent. Verify the signed binary's entitlements with:
+  ```bash
+  codesign -d --entitlements - "Clip Board.app"
+  ```
+- History encrypted at rest with **AES-GCM-256**, key in **Keychain** (`WhenUnlockedThisDeviceOnly`, non-syncable). See the *Cryptographic details* section above.
+- History file mode `0600`, directory mode `0700`, **atomic writes** (no partial-file exposure on crash).
+- History storage lives under `~/Library/Application Support/ClipboardManager/` (the conventional unsandboxed path; previously inside the sandbox container, now plain Application Support).
 
 If you have suggestions for hardening any of the above — particularly key rotation, in-memory protection, or schema integrity — open an issue (for design discussions) or follow the reporting process (for vulnerabilities).

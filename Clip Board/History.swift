@@ -460,11 +460,20 @@ final class AutoPaster {
             return
         }
         Log.autopaste.info("Activating target: \(app.localizedName ?? "?", privacy: .public) (pid=\(app.processIdentifier))")
-        app.activate(options: [])
+
+        // macOS 14+ requires the currently-active app to explicitly yield activation
+        // rights before another app can take focus. Without this, our LSUIElement
+        // retains "active app" status after the panel orders out, and the synthesized
+        // ⌘V either lands on us or nowhere. yieldActivation(to:) is the documented
+        // replacement for the legacy `.activateIgnoringOtherApps` option.
+        if #available(macOS 14.0, *) {
+            NSApp.yieldActivation(to: app)
+        }
+        app.activate()
 
         // Wait for the target app to actually be frontmost before injecting the keystroke.
-        // 500ms total budget, polled every 20ms.
-        let deadline = Date().addingTimeInterval(0.5)
+        // 600ms total budget, polled every 20ms.
+        let deadline = Date().addingTimeInterval(0.6)
         waitUntilFrontmost(app: app, deadline: deadline)
     }
 

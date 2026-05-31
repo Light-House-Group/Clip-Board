@@ -2,8 +2,25 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<!--
+	Clip-Board is NOT sandboxed. A sandboxed app cannot use
+	NSRunningApplication.activate() to bring a foreign app to the foreground,
+	which makes the "synthesize ⌘V into the previously focused app" auto-paste
+	flow silently fail. Every shipping clipboard manager (Maccy, Paste, Alfred,
+	Raycast) runs unsandboxed for the same reason.
+
+	What we still do for hardening:
+	  • Hardened runtime ON (see Xcode build settings)
+	  • No network entitlements requested or linked (verify: otool -L)
+	  • History encrypted at rest with AES-GCM-256 (key in Keychain,
+	    WhenUnlockedThisDeviceOnly, non-syncable)
+	  • Files 0600, directory 0700, atomic writes
+
+	Reviewers can verify the running binary's entitlements with:
+	  codesign -d --entitlements - "Clip Board.app"
+	-->
 	<key>com.apple.security.app-sandbox</key>
-	<true/>
+	<false/>
 	<key>com.apple.security.network.client</key>
 	<false/>
 	<key>com.apple.security.network.server</key>
@@ -18,7 +35,5 @@
 	<false/>
 	<key>com.apple.security.personal-information.calendars</key>
 	<false/>
-	<key>com.apple.security.files.user-selected.read-only</key>
-	<true/>
 </dict>
 </plist>

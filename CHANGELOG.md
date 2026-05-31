@@ -2,6 +2,30 @@
 
 All notable changes to this project are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.3] — 2026-05-31
+
+### Fixed
+
+- **Auto-paste now actually works.** Two compounding bugs were silently swallowing the synthesized ⌘V:
+  1. The App Sandbox was enabled (since v1.0.0, via `ENABLE_APP_SANDBOX = YES` in the project). A sandboxed app on macOS 14+ cannot use `NSRunningApplication.activate()` to bring a foreign app to the foreground, so the previously-focused app never actually came forward and the keystroke landed on Clip-Board (or nowhere).
+  2. Even unsandboxed, macOS 14+ requires the currently-active app to explicitly **yield activation** before another app can take focus. We now call `NSApp.yieldActivation(to:)` before activating the target, then post ⌘V once it's truly frontmost.
+
+### Changed
+
+- **App is no longer sandboxed.** Every shipping clipboard manager that does cross-app paste injection (Maccy, Paste, Alfred, Raycast) runs unsandboxed for exactly this reason — the sandbox is fundamentally incompatible with "activate any other app and synthesize a paste into it." See `SECURITY.md` for the full rationale and what hardening we *do* still apply (hardened runtime, no network linkage, AES-GCM at rest, Keychain key, file mode 0600 / dir 0700).
+- Updated `NSRunningApplication.activate(options:)` (deprecated in macOS 14) → `activate()`.
+- Bumped auto-paste activation budget from 500 ms → 600 ms (the yield handoff costs a frame or two).
+
+### Security / hygiene
+
+- Entitlements file now explicitly sets `com.apple.security.app-sandbox = false` with an inline comment explaining the trade-off, so reviewers can diff source against the signed binary and see the unsandboxed posture is intentional, not an oversight.
+
+### Migration
+
+- **Pre-1.2.3 history is automatically carried over.** Upgrading from 1.2.2 or earlier: on first launch, the old sandbox-container history (`~/Library/Containers/Siddharth.Sangwa.ClipBoard/Data/Library/Application Support/ClipboardManager/`) is copied to the new unsandboxed location (`~/Library/Application Support/ClipboardManager/`). The legacy container is left in place untouched, so downgrading still works.
+
+[1.2.3]: https://github.com/Light-House-Group/Clip-Board/releases/tag/v1.2.3
+
 ## [1.2.2] — 2026-05-30
 
 ### Fixed
