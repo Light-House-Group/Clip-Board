@@ -229,8 +229,18 @@ struct ContentView: View {
     @State private var keyboardNavigated: Bool = false
     /// Debounce so holding the arrow key doesn't spawn one popover per row as it scrolls past.
     @State private var keyboardPreviewTask: DispatchWorkItem? = nil
+    /// Mouse location at the moment of the last keyboard-nav event. Hover events that
+    /// fire while the cursor is still at this location are spurious — they were caused
+    /// by scrolling moving a new row under the stationary cursor, NOT by the user
+    /// moving the mouse — and must not stomp the keyboard selection. Cleared once the
+    /// user actually moves the mouse (>4 pt from this point).
+    @State private var mouseLocAtNav: NSPoint? = nil
     private let copyHighlightDuration: TimeInterval = 0.6
     private let keyboardPreviewDelay: TimeInterval = 0.25
+    /// Minimum cursor displacement (in screen points) we accept as "the user actually
+    /// moved the mouse" after a kb-nav event. Anything smaller is treated as the
+    /// scroll sliding rows under a stationary cursor.
+    private let mouseMoveThreshold: CGFloat = 4
 
     // Multi-select mode — entered via row context-menu "Select".
     // Click anywhere on a row toggles its selection; no leading checkboxes.
@@ -369,7 +379,25 @@ struct ContentView: View {
                 }
             }
             .onHover { hovering in
-                if hovering { hoverID = item.id; selectedID = item.id } else if hoverID == item.id { hoverID = nil; if selectedID == item.id { selectedID = nil } }
+                // If a keyboard nav just fired and the cursor hasn't actually moved
+                // since, this hover event was caused by the scroll animation moving
+                // a different row under the stationary cursor — NOT by the user
+                // moving the mouse. Ignore the selection change so keyboard nav
+                // isn't stomped back to whichever row happens to be under the cursor.
+                let mouseMoved: Bool = {
+                    guard let anchor = mouseLocAtNav else { return true }
+                    let now = NSEvent.mouseLocation
+                    return abs(now.x - anchor.x) + abs(now.y - anchor.y) > mouseMoveThreshold
+                }()
+                if mouseMoved { mouseLocAtNav = nil }
+
+                if hovering {
+                    hoverID = item.id
+                    if mouseMoved { selectedID = item.id }
+                } else if hoverID == item.id {
+                    hoverID = nil
+                    if selectedID == item.id && mouseMoved { selectedID = nil }
+                }
             }
             .contextMenu {
                 Button(item.pinned ? "Unpin" : "Pin") { withAnimation(.easeInOut(duration: 0.15)) { itemsVM.togglePin(item.id) } }
@@ -559,6 +587,10 @@ struct ContentView: View {
             let ordered = snapshot.ordered
             guard !ordered.isEmpty else { return }
             keyboardNavigated = true
+            // Anchor the cursor location so hover events from the scroll-induced
+            // row reshuffle don't stomp the keyboard selection back to where the
+            // mouse is sitting.
+            mouseLocAtNav = NSEvent.mouseLocation
             // Close any open popover IMMEDIATELY so the previous row's preview doesn't
             // linger; the debounced onChange(of: selectedID) will open the new row's
             // preview after a short settling delay.
@@ -571,6 +603,7 @@ struct ContentView: View {
             let ordered = snapshot.ordered
             guard !ordered.isEmpty else { return }
             keyboardNavigated = true
+            mouseLocAtNav = NSEvent.mouseLocation
             if previewItemID != nil { previewItemID = nil }
             keyboardPreviewTask?.cancel()
             if let currentID = selectedID, let idx = ordered.firstIndex(where: { $0.id == currentID }) {
