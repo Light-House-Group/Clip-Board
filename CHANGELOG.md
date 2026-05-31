@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.2.5] — 2026-05-31
+
+### Fixed
+
+- **Keyboard navigation no longer bounces between 2–3 rows.** When you press ↓ or ↑, the scroll animation slides a new row under the (stationary) mouse cursor. SwiftUI then fires a hover event on that row, and the parent's hover handler was setting `selectedID = item.id` — overwriting the keyboard selection on every scroll tick. The visible symptom was the list refusing to advance past whichever row the cursor had been hovering over. Fix: mouse location is now anchored at each kb-nav event; the hover handler ignores the selection-stomp until the cursor has actually moved (>4 pt). Manual mouse hover still selects normally as soon as you move the cursor.
+- **Hover preview no longer opens for short text (root cause fix).** The 1.2.4 widening of the slack threshold reduced the false-positive rate but didn't kill it: the dual-`GeometryReader` measurement could race on initial layout — if the unconstrained-height background landed first with a non-zero value while the constrained foreground was still 0, `isTruncated` briefly flipped true and the popover opened. Replaced the whole approach with a deterministic `NSAttributedString.boundingRect` measurement against the row's actual width, counting lines directly. No race, no slack heuristic.
+- **Popover orphans on Clear and search.** `Clear` now also resets the preview state; if a search filter hides the currently-previewed item, the popover dismisses automatically instead of pointing at a stale or off-screen row.
+
+### Added
+
+- **Arrow keys now open the preview popover for the selected row.** When you navigate with ↓ / ↑, the popover for the newly selected row opens after a 250 ms settle so holding the arrow key doesn't flash a popover per scrolling row. The same `previewEligible` gate from hover applies — non-truncated text rows just get the selection highlight, image rows always preview, truncated text rows show the full content.
+
+### Removed
+
+- Dead `VisibleHeightKey` and `FullHeightKey` SwiftUI preference keys (only used by the prior dual-measurement path).
+
+[1.2.5]: https://github.com/Light-House-Group/Clip-Board/releases/tag/v1.2.5
+
 ## [1.2.4] — 2026-05-31
 
 ### Added
