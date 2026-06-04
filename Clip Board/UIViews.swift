@@ -1287,6 +1287,7 @@ final class MenuBarController: NSObject {
     private func showContextMenu() {
         let menu = NSMenu()
 
+#if !APPSTORE
         if !AXIsProcessTrusted() {
             let ax = NSMenuItem(title: "Enable Auto-Paste (Accessibility)…",
                                 action: #selector(menuOpenAccessibilitySettings),
@@ -1295,6 +1296,7 @@ final class MenuBarController: NSObject {
             menu.addItem(ax)
             menu.addItem(.separator())
         }
+#endif
 
         let shortcut = NSMenuItem(title: "Set Shortcut…", action: #selector(menuSetShortcut), keyEquivalent: "")
         shortcut.target = self
@@ -1337,10 +1339,12 @@ final class MenuBarController: NSObject {
         }
     }
 
+#if !APPSTORE
     @objc private func menuOpenAccessibilitySettings() {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!
         NSWorkspace.shared.open(url)
     }
+#endif
 
     @objc private func menuToggleLaunchAtLogin() {
         Preferences.shared.launchAtLogin.toggle()

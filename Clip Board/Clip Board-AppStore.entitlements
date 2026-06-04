@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	App Store edition. The Mac App Store mandates the App Sandbox, so this build
+	is sandboxed and the auto-paste flow is compiled out (APPSTORE flag): no
+	Accessibility, no keystroke synthesis, no foreign-app activation. History
+	items are placed on the clipboard for a manual ⌘V.
+
+	The Developer ID / Homebrew edition uses "Clip Board.entitlements" instead —
+	unsandboxed, with auto-paste. Both editions ship from the same Apple Developer
+	account (team) but are signed with different certificate types: this one with
+	Apple Distribution (Apple re-signs on ingestion), the other with Developer ID
+	Application.
+
+	Same privacy posture as the direct build: no network, no device access. History
+	is AES-GCM-256 encrypted at rest with a Keychain-bound key. The sandbox stores
+	it under the app's container rather than ~/Library/Application Support.
+	-->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+	<key>com.apple.security.network.client</key>
+	<false/>
+	<key>com.apple.security.network.server</key>
+	<false/>
+	<key>com.apple.security.device.audio-input</key>
+	<false/>
+	<key>com.apple.security.device.camera</key>
+	<false/>
+	<key>com.apple.security.personal-information.location</key>
+	<false/>
+	<key>com.apple.security.personal-information.addressbook</key>
+	<false/>
+	<key>com.apple.security.personal-information.calendars</key>
+	<false/>
+</dict>
+</plist>

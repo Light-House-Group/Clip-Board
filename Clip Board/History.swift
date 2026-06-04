@@ -464,6 +464,28 @@ final class AutoPaster {
     static let shared = AutoPaster()
     private init() {}
 
+#if APPSTORE
+    // App Store edition: the binary is sandboxed (mandatory for the Mac App
+    // Store), which forbids the Accessibility API and keystroke synthesis into
+    // foreign apps. Auto-paste is compiled out entirely. History items are placed
+    // on the system clipboard; the user pastes them with ⌘V. The tracking and
+    // delivery machinery below the #else is absent from this edition's binary.
+    static func startTracking() {}
+    static func captureFrontmost() {}
+
+    static func pasteIntoPreviousApp(text: String) {
+        NSPasteboard.general.copyString(text)
+    }
+
+    static func pasteIntoPreviousApp(item: ClipItem) {
+        NSPasteboard.general.copyRichText(plain: item.text,
+                                          representations: item.richRepresentations)
+    }
+
+    static func pasteIntoPreviousApp(imageData png: Data) {
+        NSPasteboard.general.copyImageData(png)
+    }
+#else
     static var lastActiveApp: NSRunningApplication?
     private static var didPromptForAX = false
 
@@ -580,6 +602,7 @@ final class AutoPaster {
         up?.post(tap: .cghidEventTap)
         Log.autopaste.info("Posted Cmd-V")
     }
+#endif
 }
 
 // MARK: - App Icon Provider

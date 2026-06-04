@@ -24,6 +24,15 @@ Mainstream clipboard managers keep history in plaintext on disk, sync it to a ve
 
 ## Install
 
+Clip-Board ships in **two editions** built from the same source:
+
+| Edition | Channel | Auto-paste | Sandbox |
+| :--- | :--- | :--- | :--- |
+| **Direct** | Homebrew · GitHub release | ✅ pastes back into the previous app | Not sandboxed (by design) |
+| **App Store** | Mac App Store | ❌ copies to clipboard; you press ⌘V | Sandboxed (App Store requirement) |
+
+The Mac App Store mandates the App Sandbox, which forbids the Accessibility-driven auto-paste. The App Store edition therefore drops that one feature; everything else — encryption at rest, transient-type skipping, rich-text capture, search, pinning — is identical. If you want one-keystroke paste-back, use the direct edition below.
+
 ### Homebrew
 
 ```bash
@@ -40,7 +49,7 @@ brew upgrade --cask clip-board
 
 Grab `Clip-Board.zip` from the [latest release](https://github.com/Light-House-Group/Clip-Board/releases/latest), unzip, drag `Clip Board.app` into `/Applications`.
 
-The release zip is **ad-hoc signed**, so the first launch trips Gatekeeper. Right-click the app → **Open** → **Open** to bypass once. Subsequent launches are silent. (Notarized builds are a single env-var + flag away — see [Build from source](#build-from-source).)
+The release is **Developer ID–signed, notarized, and stapled**, so it opens normally on a double-click — no Gatekeeper bypass needed. Don't take that on faith: [verify the build](#verify-a-downloaded-build) before you trust it.
 
 ---
 
@@ -106,17 +115,22 @@ Pinned items are kept regardless of the history-size cap.
 
 ### Sandbox
 
-**Clip-Board is intentionally not sandboxed.** The macOS App Sandbox blocks `NSRunningApplication.activate()` on a foreign app, which silently breaks the auto-paste flow. Maccy, Paste, Alfred, and Raycast all run unsandboxed for the same reason. The hardening that *is* applied:
+**The direct edition is intentionally not sandboxed.** The macOS App Sandbox blocks `NSRunningApplication.activate()` on a foreign app, which silently breaks the auto-paste flow. Maccy, Paste, Alfred, and Raycast all run unsandboxed for the same reason. The hardening that *is* applied:
 
 - Hardened runtime ON (`ENABLE_HARDENED_RUNTIME = YES`).
 - Network entitlements explicitly `false` in the checked-in [`Clip Board.entitlements`](Clip%20Board/Clip%20Board.entitlements) — reviewers diff source against signed binary.
 - No `URLSession`, `Network.framework`, or third-party SDK linked.
+
+The **App Store edition** *is* sandboxed (`com.apple.security.app-sandbox = true` in [`Clip Board-AppStore.entitlements`](Clip%20Board/Clip%20Board-AppStore.entitlements)) — the App Store requires it. It pays for that with the auto-paste feature, which is compiled out under the `APPSTORE` flag rather than left to fail silently. Network entitlements stay `false` there too.
 
 Full rationale and the migration story (pre-1.2.3 sandboxed → 1.2.3+ unsandboxed) is in [SECURITY.md](SECURITY.md#sandbox--entitlements).
 
 ### Verify a downloaded build
 
 ```bash
+# Notarization + signing — expect "source=Notarized Developer ID".
+spctl -a -vvv "Clip Board.app"
+
 # Linked libraries — Apple system frameworks only.
 otool -L "Clip Board.app/Contents/MacOS/Clip Board"
 

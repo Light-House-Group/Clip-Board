@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented here. Format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] — 2026-06-04
+
+### Added
+
+- **Mac App Store edition.** A second, sandboxed edition now builds from the same source under the `APPSTORE` compile flag and the `Clip Board (App Store)` scheme. Because the Mac App Store mandates the App Sandbox — which forbids the Accessibility API and keystroke synthesis — **auto-paste is compiled out** of this edition: history items are placed on the clipboard and you paste them yourself with ⌘V. Everything else (encryption at rest, transient-type skipping, rich-text capture, search, pinning) is identical. The two editions share one Apple Developer account but are signed with different certificate *types*: App Store with Apple Distribution, direct with Developer ID Application.
+
+### Changed
+
+- **Bundle identifier is now `io.github.light-house-group.clipboard`** (App Store edition: `io.github.light-house-group.clipboard-appstore`), replacing the previous personal-name identifier. **Existing users upgrading the direct build must re-grant Accessibility and re-enable Launch at Login** — macOS keys those off the bundle ID. Your clipboard history is preserved: it is keyed on the Keychain service `com.clipboard.manager`, not the bundle ID.
+- **Releases are now Developer ID–signed, notarized, and stapled.** First launch of the direct build opens normally on a double-click — no more right-click → **Open** to clear Gatekeeper. Verify with `spctl -a -vvv "Clip Board.app"` (expect `source=Notarized Developer ID`) and `codesign -d --entitlements - "Clip Board.app"` (sandbox and network entitlements remain `false`).
+- **`scripts/release.sh` now self-verifies and refuses to emit a broken artifact.** The Developer ID build is rejected unless it passes `codesign --strict`, carries a non-adhoc Team signature, and keeps the App Sandbox plus network entitlements off (the posture promised in [SECURITY.md](SECURITY.md)); a `--notarize` build must additionally pass Gatekeeper as Notarized Developer ID. The script auto-detects the signing identity and writes `Clip-Board.zip.sha256` for the Homebrew cask.
+
+[1.3.0]: https://github.com/Light-House-Group/Clip-Board/releases/tag/v1.3.0
+
 ## [1.2.5] — 2026-05-31
 
 ### Fixed

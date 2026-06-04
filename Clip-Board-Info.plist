@@ -6,5 +6,10 @@
 	<string>AppIcon</string>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<!-- Export compliance: the only encryption is CryptoKit AES-GCM protecting the
+	     user's own clipboard history at rest — exempt. Pre-answers the App Store
+	     Connect export-compliance prompt on every submission. -->
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
 </dict>
 </plist>

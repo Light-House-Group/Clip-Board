@@ -59,7 +59,9 @@ When you select an item, Clip-Board writes it to `NSPasteboard.general` (the sys
 
 ## Sandbox & entitlements
 
-**Clip-Board is not sandboxed**, and this is intentional. The macOS App Sandbox blocks `NSRunningApplication.activate()` on a foreign app, which makes "bring your last-focused app back to front, then synthesize ⌘V into it" silently fail. Every shipping clipboard manager that does cross-app paste injection (Maccy, Paste, Alfred, Raycast) runs unsandboxed for the same reason. Releases prior to 1.2.3 shipped with `app-sandbox = true` set in the project; that was a packaging carry-over from the Xcode template, not a security decision, and it broke auto-paste. As of 1.2.3 the entitlements file explicitly sets it to `false` with an in-file comment explaining why.
+**The direct edition of Clip-Board is not sandboxed**, and this is intentional. The macOS App Sandbox blocks `NSRunningApplication.activate()` on a foreign app, which makes "bring your last-focused app back to front, then synthesize ⌘V into it" silently fail. Every shipping clipboard manager that does cross-app paste injection (Maccy, Paste, Alfred, Raycast) runs unsandboxed for the same reason. Releases prior to 1.2.3 shipped with `app-sandbox = true` set in the project; that was a packaging carry-over from the Xcode template, not a security decision, and it broke auto-paste. As of 1.2.3 the entitlements file explicitly sets it to `false` with an in-file comment explaining why.
+
+Since 1.3.0 there is also a **Mac App Store edition**, which *is* sandboxed (the store requires it). Rather than ship an auto-paste flow that fails silently inside the sandbox, that edition compiles the feature out entirely under the `APPSTORE` flag — it copies to the clipboard and you press ⌘V. Its entitlements live in [`Clip Board/Clip Board-AppStore.entitlements`](Clip%20Board/Clip%20Board-AppStore.entitlements) (`app-sandbox = true`, network `false`). The rest of this section describes the direct edition.
 
 What we still do for hardening, in lieu of the sandbox:
 
