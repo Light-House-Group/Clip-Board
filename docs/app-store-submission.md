@@ -23,25 +23,38 @@ sandboxed, no auto-paste). Build it from the `App-Store` branch with the
 | Min macOS | ✅ 14.0 |
 | Sandbox runtime (smoke test) | ✅ ad-hoc sandboxed launch: clipboard captured → AES-GCM encrypted → persisted to the container (`history.json.enc`, mode 0600); no sandbox denials, no crash; Keychain key created in-sandbox |
 
-## 2. Apple-account prerequisites (you must do — outside the repo)
+## 2. Apple-account prerequisites
 
-- [ ] **Confirm the signing Team** has App Store distribution. The project defaults to
-      `PT666QK286` (your Developer ID team). If your paid App Store membership is a
-      different team, change it in **Signing & Capabilities** for the App Store config.
-- [ ] **Apple Distribution certificate + provisioning profile** — none exists yet.
-      Xcode automatic signing creates both on first Archive. Nothing to do manually.
-- [ ] **Decide the seller name.** Your account is the individual "Siddharth Sangwan",
-      so the store will list it under that name. To list under **"Light House Group"**
-      you need an **Organization** Apple Developer account (requires a D-U-N-S number).
-- [ ] **Create the app record** in App Store Connect with the bundle ID above.
+**Decided:** publish under the **individual account "Siddharth Sangwan"** (team
+`PT666QK286`, the paid account that holds the Developer ID cert). Upload via **Xcode**
+(automatic signing). No App Store Connect API key, and **no manual cert/identifier/
+profile creation** — Xcode mints all three at Distribute time. The App ID needs **no
+special capabilities** (App Sandbox, SMAppService login item, and Keychain all work
+with the default App ID).
 
-## 3. Archive & upload
+- [ ] In **Xcode → Settings → Accounts**, confirm you're signed in to the Apple ID for
+      team `PT666QK286` (the one that can issue Apple Distribution certs).
+- [ ] **Create the app record** in App Store Connect: My Apps → + → New App → macOS,
+      bundle ID `io.github.light-house-group.clipboard-appstore`, primary language,
+      SKU (any unique string, e.g. `clipboard-001`), name (see §4 — verify it's free).
 
-```
-Xcode → select the "Clip Board (App Store)" scheme
-Product → Archive
-Organizer → Distribute App → App Store Connect → Upload  (automatic signing)
-```
+## 3. Archive & upload (Xcode)
+
+1. Open `Clip Board.xcodeproj`. In the scheme selector (top bar), choose
+   **`Clip Board (App Store)`**. Destination: **My Mac** / **Any Mac**.
+2. Select the **Clip Board** target → **Signing & Capabilities** → the
+   **`Release-AppStore`** column. Confirm: *Automatically manage signing* ✓,
+   Team = your `PT666QK286` account, and **App Sandbox** capability is listed.
+   (Xcode will create the Apple Distribution cert + provisioning profile here.)
+3. **Product → Archive.** (If "Archive" is greyed out, set the run destination to a
+   generic Mac, not a simulator.)
+4. In **Organizer**, select the new archive → **Distribute App** →
+   **App Store Connect** → **Upload** → keep automatic signing → **Upload**.
+5. Wait for "Upload successful." The build then takes ~5–30 min to finish
+   *Processing* in App Store Connect before you can attach it to a version.
+
+**Re-uploads:** every new upload needs a higher build number. Bump
+`CURRENT_PROJECT_VERSION` (currently `10`) before re-archiving.
 
 ## 4. App Store Connect listing — draft copy
 
