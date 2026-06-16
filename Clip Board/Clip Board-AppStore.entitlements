@@ -14,25 +14,20 @@
 	Apple Distribution (Apple re-signs on ingestion), the other with Developer ID
 	Application.
 
-	Same privacy posture as the direct build: no network, no device access. History
-	is AES-GCM-256 encrypted at rest with a Keychain-bound key. The sandbox stores
-	it under the app's container rather than ~/Library/Application Support.
+	Privacy posture: no network, no device access, no personal-information access.
+	Under the App Sandbox a capability is DENIED unless its entitlement is present
+	and set to true — so "we don't use X" is expressed by OMITTING the key, never
+	by setting it to <false/>. Apple's sandbox validator REJECTS any sandbox
+	entitlement whose value is false (Guideline 2.4.5(i) / Technical Q&A QA1773),
+	which is why this file lists only the sandbox switch itself. Do NOT add
+	network.client, network.server, device.audio-input, device.camera,
+	personal-information.{addressbook,calendars,location}, or any other capability
+	key here unless the app genuinely needs it — and if it does, set it to <true/>.
+
+	History is AES-GCM-256 encrypted at rest with a Keychain-bound key; the sandbox
+	stores it under the app's container rather than ~/Library/Application Support.
 	-->
 	<key>com.apple.security.app-sandbox</key>
 	<true/>
-	<key>com.apple.security.network.client</key>
-	<false/>
-	<key>com.apple.security.network.server</key>
-	<false/>
-	<key>com.apple.security.device.audio-input</key>
-	<false/>
-	<key>com.apple.security.device.camera</key>
-	<false/>
-	<key>com.apple.security.personal-information.location</key>
-	<false/>
-	<key>com.apple.security.personal-information.addressbook</key>
-	<false/>
-	<key>com.apple.security.personal-information.calendars</key>
-	<false/>
 </dict>
 </plist>
