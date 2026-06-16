@@ -121,7 +121,7 @@ Pinned items are kept regardless of the history-size cap.
 - Network entitlements explicitly `false` in the checked-in [`Clip Board.entitlements`](Clip%20Board/Clip%20Board.entitlements) — reviewers diff source against signed binary.
 - No `URLSession`, `Network.framework`, or third-party SDK linked.
 
-The **App Store edition** *is* sandboxed (`com.apple.security.app-sandbox = true` in [`Clip Board-AppStore.entitlements`](Clip%20Board/Clip%20Board-AppStore.entitlements)) — the App Store requires it. It pays for that with the auto-paste feature, which is compiled out under the `APPSTORE` flag rather than left to fail silently. Network entitlements stay `false` there too.
+The **App Store edition** *is* sandboxed (`com.apple.security.app-sandbox = true` in [`Clip Board-AppStore.entitlements`](Clip%20Board/Clip%20Board-AppStore.entitlements)) — the App Store requires it. It pays for that with the auto-paste feature, which is compiled out under the `APPSTORE` flag rather than left to fail silently. Unlike the direct edition, it lists **no** network or device entitlements at all — they're *omitted*, not set to `false`, because the App Sandbox validator rejects any sandbox entitlement whose value is `false`.
 
 Full rationale and the migration story (pre-1.2.3 sandboxed → 1.2.3+ unsandboxed) is in [SECURITY.md](SECURITY.md#sandbox--entitlements).
 

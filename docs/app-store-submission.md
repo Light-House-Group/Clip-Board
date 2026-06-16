@@ -12,7 +12,7 @@ sandboxed, no auto-paste). Build it from the `App-Store` branch with the
 | :--- | :--- |
 | App Sandbox enabled | ✅ `ENABLE_APP_SANDBOX = YES` (Release-AppStore) + `Clip Board-AppStore.entitlements` |
 | Auto-paste removed | ✅ compiled out under `APPSTORE`; binary has 0 `AXIsProcessTrusted` refs |
-| No network entitlements / no network code | ✅ entitlements `false`; `otool -L` = Apple frameworks only |
+| No network/device entitlements | ✅ unused sandbox keys **omitted** (not `false` — see resubmission note); `otool -L` = Apple frameworks only |
 | Bundle ID | ✅ `io.github.light-house-group.clipboard-appstore` |
 | App icon | ✅ full 10-size PNG set, 1024 has no alpha |
 | Privacy manifest | ✅ `PrivacyInfo.xcprivacy` (no collection; UserDefaults reason `CA92.1`) |
@@ -22,6 +22,19 @@ sandboxed, no auto-paste). Build it from the `App-Store` branch with the
 | Copyright string | ✅ `© 2026 Siddharth Sangwan` |
 | Min macOS | ✅ 14.0 |
 | Sandbox runtime (smoke test) | ✅ ad-hoc sandboxed launch: clipboard captured → AES-GCM encrypted → persisted to the container (`history.json.enc`, mode 0600); no sandbox denials, no crash; Keychain key created in-sandbox |
+
+> **Resubmission note — submission #1 (version 1.0, build 10) was rejected 2026-06-15 under
+> Guideline 2.4.5(i).** The entitlements file had declared seven sandbox capabilities
+> (`network.client`, `network.server`, `device.audio-input`, `device.camera`,
+> `personal-information.{addressbook,calendars,location}`) as `<false/>`. **Apple's sandbox
+> validator rejects any sandbox entitlement whose value is `false`** — an unused capability
+> must be *absent*, not `false`. Fixed by deleting all seven keys; the file now carries only
+> `app-sandbox = true`. Build number bumped to **11** for the resubmission.
+>
+> ⚠️ Do **not** reintroduce a `<false/>` sandbox key here. This is the *opposite* of the
+> **direct** edition, where `Clip Board.entitlements` intentionally keeps `network.* = false`
+> for source-vs-binary transparency — that's fine because no App Store validator runs on a
+> Developer ID build. Don't copy that pattern into this file, and don't remove it from that one.
 
 ## 2. Apple-account prerequisites
 
@@ -53,8 +66,13 @@ with the default App ID).
 5. Wait for "Upload successful." The build then takes ~5–30 min to finish
    *Processing* in App Store Connect before you can attach it to a version.
 
-**Re-uploads:** every new upload needs a higher build number. Bump
-`CURRENT_PROJECT_VERSION` (currently `10`) before re-archiving.
+**Re-uploads:** every new upload needs a higher build number. `CURRENT_PROJECT_VERSION`
+is now `11` (was `10` for the rejected submission #1) — bump it again before any further
+re-archive.
+
+**Version number:** this build's marketing version is **1.3.0** (`MARKETING_VERSION`).
+Submission #1 was reviewed as "1.0", so set the App Store Connect **version record to 1.3.0**
+to match the binary before attaching build 11 (both editions share the 1.3.0 version line).
 
 ## 4. App Store Connect listing — draft copy
 
